@@ -17,13 +17,30 @@
 
 import json
 import os
+import sys
 import tempfile
 import unittest
+from contextlib import ExitStack
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import tests.ut.distributed.ascend_store._mock_deps  # noqa: F401, E402
-from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.backend import Backend
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend import (
+    backend_map,
+    get_layerwise_protocol,
+)
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend import memcache_backend as memcache_module
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.base import Backend
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.memcache_backend import (
+    MemcacheBackend,
+    extract_layout_config,
+    make_full_key,
+    make_hit_check_keys,
+    make_partial_key,
+)
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.mooncake_backend import (
+    DEFAULT_TENANT_ID,
+    MooncakeBackend,
     MooncakeStoreConfig,
     _convert_to_bytes,
     _parse_global_segment_size,
@@ -31,8 +48,12 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.mooncake_b
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.yuanrong_backend import (
     YuanrongConfig,
-    YuanrongHelper,
 )
+
+
+def _format_log_call(call):
+    args = call.args
+    return args[0] % args[1:]
 
 
 # =========================================================================
@@ -42,6 +63,33 @@ class TestBackendABC(unittest.TestCase):
     def test_cannot_instantiate(self):
         with self.assertRaises(TypeError):
             Backend(MagicMock())  # type: ignore[abstract]
+
+
+# =========================================================================
+# Backend layerwise protocol registry
+# =========================================================================
+class TestLayerwiseProtocolRegistry(unittest.TestCase):
+    """``get_layerwise_protocol`` is the generic layers' only knowledge of
+    layerwise support: it resolves the backend module carrying the layerwise
+    protocol functions (registered under the normalized backend name), or
+    None when the entry carries no protocol marker."""
+
+    def test_get_layerwise_protocol_resolves_module(self):
+        protocol = get_layerwise_protocol("memcache")
+        self.assertIsNotNone(protocol)
+        for func_name in ("make_full_key", "make_partial_key", "make_hit_check_keys", "extract_layout_config"):
+            with self.subTest(func=func_name):
+                self.assertTrue(callable(getattr(protocol, func_name, None)))
+
+    def test_get_layerwise_protocol_normalizes_name(self):
+        for backend_name in ("MEMCACHE", " Memcache "):
+            with self.subTest(backend=backend_name):
+                self.assertIsNotNone(get_layerwise_protocol(backend_name))
+
+    def test_get_layerwise_protocol_returns_none_without_protocol(self):
+        for backend_name in ("mooncake", "yuanrong", "nonexistent"):
+            with self.subTest(backend=backend_name):
+                self.assertIsNone(get_layerwise_protocol(backend_name))
 
 
 def _make_mooncake_store_config(**overrides) -> MooncakeStoreConfig:
@@ -62,128 +110,79 @@ def _make_mooncake_store_config(**overrides) -> MooncakeStoreConfig:
 # =========================================================================
 class TestMooncakeStoreConfig(unittest.TestCase):
     def test_from_file(self):
-        config = {
-            "metadata_server": "127.0.0.1:2379",
-            "global_segment_size": "2GB",
-            "local_buffer_size": "1GB",
-            "protocol": "ascend",
-            "device_name": "npu0",
-            "master_server_address": "127.0.0.1:8080",
-        }
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
-            json.dump(config, f)
-            f.flush()
-            path = f.name
+        cfg = _make_mooncake_store_config(
+            metadata_server="127.0.0.1:2379",
+            global_segment_size="2GB",
+            local_buffer_size="1GB",
+            protocol="ascend",
+            device_name="npu0",
+            master_server_address="127.0.0.1:8080",
+        )
+        self.assertEqual(cfg.global_segment_size, 2 * 1024**3)
+        self.assertEqual(cfg.local_buffer_size, 1024**3)
+        self.assertEqual(cfg.device_name, "npu0")
 
-        try:
-            cfg = MooncakeStoreConfig.from_file(path)
-            self.assertEqual(cfg.metadata_server, "127.0.0.1:2379")
-            self.assertEqual(cfg.global_segment_size, 2 * 1024**3)
-            self.assertEqual(cfg.local_buffer_size, 1 * 1024**3)
-            self.assertEqual(cfg.protocol, "ascend")
-            self.assertEqual(cfg.device_name, "npu0")
-        finally:
-            os.unlink(path)
+        defaults = _make_mooncake_store_config()
+        self.assertEqual(defaults.protocol, "ascend")
+        self.assertEqual(defaults.device_name, "")
+        self.assertFalse(defaults.enable_ssd_offload)
+        self.assertEqual(defaults.tenant_id, DEFAULT_TENANT_ID)
 
-    def test_from_file_defaults(self):
-        config = {
-            "metadata_server": "localhost:2379",
-            "master_server_address": "localhost:8080",
-        }
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
-            json.dump(config, f)
-            f.flush()
-            path = f.name
-
-        try:
-            cfg = MooncakeStoreConfig.from_file(path)
-            self.assertEqual(cfg.protocol, "ascend")
-            self.assertEqual(cfg.device_name, "")
-            self.assertFalse(cfg.enable_ssd_offload)
-            self.assertEqual(cfg.ssd_offload_path, "")
-        finally:
-            os.unlink(path)
-
-    def test_from_file_ssd_offload(self):
         ssd_path = TestMooncakeStoreConfig._writable_ssd_path()
         self.addCleanup(lambda: os.rmdir(ssd_path))
-        cfg = _make_mooncake_store_config(
-            enable_ssd_offload=True,
-            ssd_offload_path=ssd_path,
-        )
-        self.assertTrue(cfg.enable_ssd_offload)
-        self.assertEqual(cfg.ssd_offload_path, ssd_path)
+        ssd = _make_mooncake_store_config(enable_ssd_offload=True, ssd_offload_path=ssd_path)
+        self.assertEqual(ssd.ssd_offload_path, ssd_path)
 
-    def test_ssd_offload_requires_absolute_path(self):
-        with self.assertRaises(ValueError):
-            _make_mooncake_store_config(
-                enable_ssd_offload=True,
-                ssd_offload_path="relative/path",
-            )
+    def test_from_file_normalizes_tenant_id(self):
+        for value, expected in (
+            (None, DEFAULT_TENANT_ID),
+            ("", DEFAULT_TENANT_ID),
+            ("   ", DEFAULT_TENANT_ID),
+            ("tenant-a", "tenant-a"),
+            ("  tenant-a  ", "tenant-a"),
+        ):
+            with self.subTest(value=value):
+                cfg = _make_mooncake_store_config(tenant_id=value)
+                self.assertEqual(cfg.tenant_id, expected)
 
-    def test_ssd_offload_requires_path_in_json(self):
-        with self.assertRaises(ValueError):
-            _make_mooncake_store_config(enable_ssd_offload=True)
+    def test_from_file_rejects_non_string_tenant_id(self):
+        with self.assertRaisesRegex(TypeError, "tenant_id must be a string or null"):
+            _make_mooncake_store_config(tenant_id=False)
+
+    def test_ssd_offload_validation(self):
+        for path in ("relative/path", None):
+            with self.subTest(path=path), self.assertRaises(ValueError):
+                kwargs = {"ssd_offload_path": path} if path else {}
+                _make_mooncake_store_config(enable_ssd_offload=True, **kwargs)
 
     @staticmethod
     def _writable_ssd_path() -> str:
         return tempfile.mkdtemp(prefix="mooncake_ssd_ut_")
 
-    @patch(
-        "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend."
-        "mooncake_backend._mooncake_setup_supports_ssd_offload",
-        return_value=False,
-    )
-    def test_ssd_setup_kwargs_off_when_disabled(self, _mock_supports):
-        cfg = _make_mooncake_store_config()
-        self.assertEqual(_ssd_setup_kwargs(cfg), {})
+    def test_ssd_setup_kwargs(self):
+        target = (
+            "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend."
+            "mooncake_backend._mooncake_setup_supports_ssd_offload"
+        )
+        with patch(target, return_value=False):
+            self.assertEqual(_ssd_setup_kwargs(_make_mooncake_store_config()), {})
 
-    @patch(
-        "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend."
-        "mooncake_backend._mooncake_setup_supports_ssd_offload",
-        return_value=False,
-    )
-    def test_ssd_setup_kwargs_raises_on_old_mooncake(self, _mock_supports):
         ssd_path = TestMooncakeStoreConfig._writable_ssd_path()
         self.addCleanup(lambda: os.rmdir(ssd_path))
-        cfg = _make_mooncake_store_config(
-            enable_ssd_offload=True,
-            ssd_offload_path=ssd_path,
-        )
-        with self.assertRaises(RuntimeError):
+        cfg = _make_mooncake_store_config(enable_ssd_offload=True, ssd_offload_path=ssd_path)
+        with patch(target, return_value=False), self.assertRaises(RuntimeError):
             _ssd_setup_kwargs(cfg)
-
-    @patch(
-        "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend."
-        "mooncake_backend._mooncake_setup_supports_ssd_offload",
-        return_value=True,
-    )
-    def test_ssd_setup_kwargs_when_supported(self, _mock_supports):
-        ssd_path = TestMooncakeStoreConfig._writable_ssd_path()
-        self.addCleanup(lambda: os.rmdir(ssd_path))
-        cfg = _make_mooncake_store_config(
-            enable_ssd_offload=True,
-            ssd_offload_path=ssd_path,
-        )
-        self.assertEqual(
-            _ssd_setup_kwargs(cfg),
-            {
-                "enable_ssd_offload": cfg.enable_ssd_offload,
-                "ssd_offload_path": cfg.ssd_offload_path,
-            },
-        )
-
-    def test_load_from_env_missing(self):
-        with patch.dict(os.environ, {}, clear=True):
-            os.environ.pop("MOONCAKE_CONFIG_PATH", None)
-            with self.assertRaises(ValueError):
-                MooncakeStoreConfig.load_from_env()
+        with patch(target, return_value=True):
+            self.assertEqual(
+                _ssd_setup_kwargs(cfg),
+                {"enable_ssd_offload": True, "ssd_offload_path": ssd_path},
+            )
 
     def test_load_from_env(self):
-        config = {
-            "metadata_server": "host:1234",
-            "master_server_address": "host:5678",
-        }
+        with patch.dict(os.environ, {}, clear=True), self.assertRaises(ValueError):
+            MooncakeStoreConfig.load_from_env()
+
+        config = {"metadata_server": "host:1234", "master_server_address": "host:5678"}
         with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
             json.dump(config, f)
             f.flush()
@@ -198,38 +197,24 @@ class TestMooncakeStoreConfig(unittest.TestCase):
 
 
 class TestParseGlobalSegmentSize(unittest.TestCase):
-    def test_int(self):
-        self.assertEqual(_parse_global_segment_size(1024), 1024)
+    def test_valid_values(self):
+        cases = [
+            (1024, 1024),
+            ("2GB", 2 * 1024**3),
+            ("512MB", 512 * 1024**2),
+            ("256KB", 256 * 1024),
+            ("4096B", 4096),
+            ("2048", 2048),
+            (2048.0, 2048),
+        ]
+        for value, expected in cases:
+            with self.subTest(value=value):
+                self.assertEqual(_parse_global_segment_size(value), expected)
 
-    def test_gb(self):
-        self.assertEqual(_parse_global_segment_size("2GB"), 2 * 1024**3)
-
-    def test_mb(self):
-        self.assertEqual(_parse_global_segment_size("512MB"), 512 * 1024**2)
-
-    def test_kb(self):
-        self.assertEqual(_parse_global_segment_size("256KB"), 256 * 1024)
-
-    def test_b(self):
-        self.assertEqual(_parse_global_segment_size("4096B"), 4096)
-
-    def test_no_unit(self):
-        self.assertEqual(_parse_global_segment_size("2048"), 2048)
-
-    def test_float_input(self):
-        self.assertEqual(_parse_global_segment_size(2048.0), 2048)
-
-    def test_empty_string(self):
-        with self.assertRaises(ValueError):
-            _parse_global_segment_size("")
-
-    def test_invalid_format(self):
-        with self.assertRaises(ValueError):
-            _parse_global_segment_size("abcGB")
-
-    def test_unsupported_type(self):
-        with self.assertRaises(TypeError):
-            _parse_global_segment_size(None)  # type: ignore[arg-type]
+    def test_invalid_values(self):
+        for value, error in [("", ValueError), ("abcGB", ValueError), (None, TypeError)]:
+            with self.subTest(value=value), self.assertRaises(error):
+                _parse_global_segment_size(value)  # type: ignore[arg-type]
 
 
 class TestConvertToBytes(unittest.TestCase):
@@ -246,100 +231,185 @@ class TestConvertToBytes(unittest.TestCase):
 # YuanrongConfig
 # =========================================================================
 class TestYuanrongConfig(unittest.TestCase):
-    def test_load_from_env(self):
-        with patch.dict(
-            os.environ,
-            {
-                "DS_WORKER_ADDR": "host:1234",
-                "DS_ENABLE_EXCLUSIVE_CONNECTION": "1",
-                "DS_ENABLE_REMOTE_H2D": "0",
-            },
-        ):
-            cfg = YuanrongConfig.load_from_env()
-            self.assertEqual(cfg.worker_addr, "host:1234")
-            self.assertTrue(cfg.enable_exclusive_connection)
-            self.assertFalse(cfg.enable_remote_h2d)
+    def _write_config(self, **overrides):
+        fd, path = tempfile.mkstemp(suffix=".json")
+        with os.fdopen(fd, "w") as f:
+            json.dump(overrides, f)
+        self.addCleanup(os.remove, path)
+        return path
 
-    def test_load_from_env_missing(self):
-        with patch.dict(os.environ, {}, clear=True):
-            os.environ.pop("DS_WORKER_ADDR", None)
-            with self.assertRaises(ValueError):
-                YuanrongConfig.load_from_env()
+    def test_from_file(self):
+        path = self._write_config(
+            worker_addr="host:1234",
+            enable_remote_h2d=False,
+            remote_h2d_transport_backend="HIXL",
+            connect_timeout_ms=12000,
+            request_timeout_ms=8000,
+            get_sub_timeout_ms=3000,
+            enable_dev_mem_pregister=True,
+        )
+        cfg = YuanrongConfig.from_file(path)
+        self.assertEqual(cfg.worker_addr, "host:1234")
+        self.assertFalse(cfg.enable_remote_h2d)
+        self.assertEqual(cfg.remote_h2d_transport_backend, "HIXL")
+        self.assertFalse(cfg.enable_fabric_mem)
+        self.assertEqual(cfg.connect_timeout_ms, 12000)
+        self.assertEqual(cfg.request_timeout_ms, 8000)
+        self.assertEqual(cfg.get_sub_timeout_ms, 3000)
+        self.assertTrue(cfg.enable_dev_mem_pregister)
 
-    def test_load_from_env_defaults(self):
-        with patch.dict(os.environ, {"DS_WORKER_ADDR": "h:1"}):
-            cfg = YuanrongConfig.load_from_env()
-            self.assertFalse(cfg.enable_exclusive_connection)
-            self.assertFalse(cfg.enable_remote_h2d)
+    def test_from_file_defaults(self):
+        path = self._write_config(worker_addr="h:1")
+        cfg = YuanrongConfig.from_file(path)
+        self.assertFalse(cfg.enable_remote_h2d)
+        self.assertEqual(cfg.remote_h2d_transport_backend, "HIXL")
+        self.assertFalse(cfg.enable_fabric_mem)
+        self.assertEqual(cfg.connect_timeout_ms, 9000)
+        self.assertEqual(cfg.request_timeout_ms, 0)
+        self.assertEqual(cfg.get_sub_timeout_ms, 0)
+        self.assertFalse(cfg.enable_dev_mem_pregister)
 
-
-# =========================================================================
-# YuanrongHelper
-# =========================================================================
-class TestYuanrongHelper(unittest.TestCase):
-    def setUp(self):
-        self.blob_cls = MagicMock()
-        self.blob_list_cls = MagicMock()
-        self.helper = YuanrongHelper(self.blob_cls, self.blob_list_cls)
-
-    def test_normalize_keys_short_valid(self):
-        keys = ["abc-123", "key_2"]
-        result = self.helper.normalize_keys(keys)
-        self.assertEqual(result, keys)
-
-    def test_normalize_keys_with_invalid_chars(self):
-        keys = ["key with spaces/and.dots"]
-        result = self.helper.normalize_keys(keys)
-        self.assertEqual(len(result), 1)
-        # Should not contain the original invalid chars
-        self.assertNotIn(" ", result[0])
-        self.assertNotIn("/", result[0])
-        # Should have hash suffix
-        self.assertIn("__", result[0])
-
-    def test_normalize_keys_at_max_length(self):
-        max_length_key = "a" * 1024
-        result = self.helper.normalize_keys([max_length_key])
-        self.assertEqual(result, [max_length_key])
-
-    def test_normalize_keys_over_max_length(self):
-        long_key = "a" * 1025
-        result = self.helper.normalize_keys([long_key])
-        self.assertEqual(len(result), 1)
-        self.assertEqual(len(result[0]), 1024)
-        self.assertIn("__", result[0])
-
-    def test_make_blob_lists(self):
-        self.helper._device_id = 0
-        addrs = [[100, 200], [300, 400]]
-        sizes = [[10, 20], [30, 40]]
-        result = self.helper.make_blob_lists(addrs, sizes)
-        self.assertEqual(len(result), 2)
-        self.assertEqual(self.blob_cls.call_count, 4)
-
-    def test_make_blob_lists_length_mismatch(self):
-        self.helper._device_id = 0
-        with self.assertRaises(ValueError):
-            self.helper.make_blob_lists([[1]], [[1, 2], [3, 4]])
-
-    def test_make_blob_lists_inner_length_mismatch(self):
-        self.helper._device_id = 0
-        with self.assertRaises(ValueError):
-            self.helper.make_blob_lists([[1, 2]], [[1]])
-
-    def test_make_blob_lists_no_device(self):
-        self.helper._device_id = None
-        with self.assertRaises(RuntimeError):
-            self.helper.make_blob_lists([[1]], [[1]])
+    def test_from_file_fabric_mem_with_hixl(self):
+        path = self._write_config(
+            worker_addr="h:1",
+            remote_h2d_transport_backend="HIXL",
+            enable_fabric_mem=True,
+        )
+        cfg = YuanrongConfig.from_file(path)
+        self.assertTrue(cfg.enable_fabric_mem)
 
 
 # =========================================================================
 # MooncakeBackend (mocked store)
 # =========================================================================
+class TestMooncakeBackendSetup(unittest.TestCase):
+    _MODULE_PATH = "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.mooncake_backend"
+
+    def _make_backend(
+        self,
+        *,
+        config: MooncakeStoreConfig,
+        use_fabric_mem: bool,
+        contribute_memory: bool = True,
+    ) -> MooncakeBackend:
+        backend = MooncakeBackend.__new__(MooncakeBackend)
+        backend.parallel_config = MagicMock()
+        backend.config = config
+        backend.local_seg = None
+        backend._use_fabric_mem = use_fabric_mem
+        backend._contribute_memory = contribute_memory
+        return backend
+
+    def _setup_store(self, backend: MooncakeBackend, store: MagicMock):
+        transfer_engine = MagicMock()
+        transfer_engine.get_rpc_port.return_value = 50052
+        fake_store_module = sys.modules["mooncake.store"]
+        with (
+            patch.object(
+                fake_store_module,
+                "MooncakeDistributedStore",
+                return_value=store,
+                create=True,
+            ),
+            patch(f"{self._MODULE_PATH}.get_ip", return_value="10.0.0.7"),
+            patch(f"{self._MODULE_PATH}.global_te") as mock_global_te,
+            patch(f"{self._MODULE_PATH}.get_global_rank", return_value=3),
+            patch(
+                f"{self._MODULE_PATH}._mooncake_setup_supports_ssd_offload",
+                return_value=True,
+            ),
+        ):
+            mock_global_te.get_transfer_engine.return_value = transfer_engine
+            return backend._setup_store()
+
+    def test_setup_omits_default_tenant_for_all_memory_paths(self):
+        for use_fabric_mem in (False, True):
+            with self.subTest(use_fabric_mem=use_fabric_mem):
+                backend = self._make_backend(
+                    config=_make_mooncake_store_config(),
+                    use_fabric_mem=use_fabric_mem,
+                )
+                store = MagicMock()
+                store.setup.return_value = 0
+
+                result = self._setup_store(backend, store)
+
+                self.assertIs(result, store)
+                self.assertNotIn("tenant_id", store.setup.call_args.kwargs)
+
+    def test_setup_forwards_tenant_for_all_memory_paths(self):
+        for use_fabric_mem in (False, True):
+            with self.subTest(use_fabric_mem=use_fabric_mem):
+                backend = self._make_backend(
+                    config=_make_mooncake_store_config(tenant_id="  tenant-a  "),
+                    use_fabric_mem=use_fabric_mem,
+                )
+                store = MagicMock()
+                store.setup.return_value = 0
+
+                self._setup_store(backend, store)
+
+                self.assertEqual(store.setup.call_args.kwargs["tenant_id"], "tenant-a")
+
+    def test_setup_preserves_ssd_kwargs_with_tenant(self):
+        with tempfile.TemporaryDirectory(prefix="mooncake_ssd_ut_") as ssd_path:
+            config = _make_mooncake_store_config(
+                tenant_id="tenant-a",
+                enable_ssd_offload=True,
+                ssd_offload_path=ssd_path,
+            )
+            for use_fabric_mem in (False, True):
+                with self.subTest(use_fabric_mem=use_fabric_mem):
+                    backend = self._make_backend(
+                        config=config,
+                        use_fabric_mem=use_fabric_mem,
+                    )
+                    store = MagicMock()
+                    store.setup.return_value = 0
+
+                    self._setup_store(backend, store)
+
+                    setup_kwargs = store.setup.call_args.kwargs
+                    self.assertEqual(setup_kwargs["tenant_id"], "tenant-a")
+                    self.assertIs(setup_kwargs["enable_ssd_offload"], True)
+                    self.assertEqual(setup_kwargs["ssd_offload_path"], os.path.join(ssd_path, "rank_3"))
+
+    def test_scheduler_client_forwards_tenant(self):
+        config = _make_mooncake_store_config(tenant_id="tenant-a")
+        for use_fabric_mem in (False, True):
+            with self.subTest(use_fabric_mem=use_fabric_mem):
+                backend = self._make_backend(
+                    config=config,
+                    use_fabric_mem=use_fabric_mem,
+                    contribute_memory=False,
+                )
+                store = MagicMock()
+                store.setup.return_value = 0
+
+                self._setup_store(backend, store)
+
+                setup_kwargs = store.setup.call_args.kwargs
+                self.assertEqual(setup_kwargs["tenant_id"], "tenant-a")
+                self.assertEqual(setup_kwargs["global_segment_size"], 0)
+                self.assertEqual(setup_kwargs["local_buffer_size"], 0)
+
+    def test_non_default_tenant_preserves_setup_type_error(self):
+        setup_error = TypeError("setup(): incompatible function arguments")
+        backend = self._make_backend(
+            config=_make_mooncake_store_config(tenant_id="tenant-a"),
+            use_fabric_mem=False,
+        )
+        store = MagicMock()
+        store.setup.side_effect = setup_error
+
+        with self.assertRaises(TypeError) as context:
+            self._setup_store(backend, store)
+
+        self.assertIs(context.exception, setup_error)
+
+
 class TestMooncakeBackendMethods(unittest.TestCase):
     def _make_backend(self):
-        from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.mooncake_backend import MooncakeBackend
-
         with (
             patch.dict(os.environ, {"MOONCAKE_CONFIG_PATH": "/dev/null"}),
             patch.object(MooncakeBackend, "__init__", lambda self, pc: None),
@@ -348,6 +418,7 @@ class TestMooncakeBackendMethods(unittest.TestCase):
             backend.store = MagicMock()
             backend.config = MagicMock()
             backend.local_seg = "127.0.0.1:1234"
+            backend._dp_init_barrier = False
             backend._lazy_init = False
             backend._store_initialized = True
             backend._use_fabric_mem = False
@@ -361,37 +432,25 @@ class TestMooncakeBackendMethods(unittest.TestCase):
         result = b.exists(["k1", "k2"])
         self.assertEqual(result, [1, 0])
 
-    def test_put(self):
-        b = self._make_backend()
-        b.store.batch_put_from_multi_buffers.return_value = [0, 0]
-        b.put(["k1"], [[100]], [[10]])
-        b.store.batch_put_from_multi_buffers.assert_called_once()
-
-    def test_put_error(self):
-        b = self._make_backend()
-        b.store.batch_put_from_multi_buffers.return_value = [-1]
-        b.put(["k1"], [[100]], [[10]])  # Should log error but not raise
-
-    def test_put_exception(self):
-        b = self._make_backend()
-        b.store.batch_put_from_multi_buffers.side_effect = Exception("fail")
-        b.put(["k1"], [[100]], [[10]])  # Should log error but not raise
-
-    def test_get(self):
-        b = self._make_backend()
-        b.store.batch_get_into_multi_buffers.return_value = [0]
-        b.get(["k1"], [[100]], [[10]])
-        b.store.batch_get_into_multi_buffers.assert_called_once()
-
-    def test_get_error(self):
-        b = self._make_backend()
-        b.store.batch_get_into_multi_buffers.return_value = [-1]
-        b.get(["k1"], [[100]], [[10]])
-
-    def test_get_exception(self):
-        b = self._make_backend()
-        b.store.batch_get_into_multi_buffers.side_effect = Exception("fail")
-        b.get(["k1"], [[100]], [[10]])
+    def test_transfers(self):
+        module = "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.mooncake_backend.logger"
+        for operation, store_method in [
+            ("put", "batch_put_from_multi_buffers"),
+            ("get", "batch_get_into_multi_buffers"),
+        ]:
+            for result in ([0], [-1], RuntimeError("backend fail")):
+                with self.subTest(operation=operation, result=result):
+                    backend = self._make_backend()
+                    method = getattr(backend.store, store_method)
+                    if isinstance(result, Exception):
+                        method.side_effect = result
+                    else:
+                        method.return_value = result
+                    with patch(module) as logger:
+                        getattr(backend, operation)(["k1"], [[100]], [[10]])
+                    method.assert_called_once()
+                    if result != [0]:
+                        logger.error.assert_called()
 
     def test_register_buffer(self):
         b = self._make_backend()
@@ -434,152 +493,375 @@ class TestYuanrongBackendMethods(unittest.TestCase):
 
         with patch.object(YuanrongBackend, "__init__", lambda self, pc: None):
             backend = YuanrongBackend.__new__(YuanrongBackend)
-            backend._helper = MagicMock()
-            backend._helper._device_id = 0
-            backend._helper.normalize_keys = lambda keys: keys
-            backend._helper.make_blob_lists = lambda a, s: [MagicMock() for _ in a]
-            backend._hetero_client = MagicMock()
+            backend.store = MagicMock()
+            backend.store.mget_h2d_from_multi_buffers.return_value = []
+            backend.store.mset_d2h_from_multi_buffers.return_value = None
+            backend.store.batch_is_exist.return_value = [1, 0]
             backend._ds_set_param = MagicMock()
-            backend._is_a2 = False
+            backend._needs_dev_mem_pregister = False
             backend._registered_buffers = None
             backend._buffers_registered = False
             backend.config = YuanrongConfig(
                 worker_addr="127.0.0.1:0",
-                enable_exclusive_connection=False,
                 enable_remote_h2d=False,
+                remote_h2d_transport_backend="P2P_TRANSFER",
+                enable_fabric_mem=False,
+                get_sub_timeout_ms=1234,
+                enable_dev_mem_pregister=False,
             )
             backend.rank = 0
             return backend
 
-    def test_exists_empty(self):
-        b = self._make_backend()
-        result = b.exists([])
-        self.assertEqual(result, [])
-
     def test_exists(self):
         b = self._make_backend()
-        b._hetero_client.exist.return_value = [True, False]
+        b.store.batch_is_exist.return_value = [1, 0]
         result = b.exists(["k1", "k2"])
         self.assertEqual(result, [1, 0])
+        b.store.batch_is_exist.assert_called_once_with(["k1", "k2"])
 
     def test_exists_exception(self):
         b = self._make_backend()
-        b._hetero_client.exist.side_effect = Exception("fail")
+        b.store.batch_is_exist.side_effect = Exception("fail")
         result = b.exists(["k1"])
         self.assertEqual(result, [0])
 
-    def test_get_empty(self):
-        b = self._make_backend()
-        result = b.get([], [], [])
-        self.assertEqual(result, [])
-        b._hetero_client.mget_h2d.assert_not_called()
-
     def test_get(self):
         b = self._make_backend()
-        b._hetero_client.mget_h2d.return_value = []
+        b.store.mget_h2d_from_multi_buffers.return_value = []
         result = b.get(["k1"], [[100]], [[10]])
         self.assertEqual(result, [0])
-        b._hetero_client.mget_h2d.assert_called_once()
+        b.store.mget_h2d_from_multi_buffers.assert_called_once_with(["k1"], [[100]], [[10]], 1234)
 
     def test_get_partial_failure(self):
         b = self._make_backend()
-        b._hetero_client.mget_h2d.return_value = ["k2"]
+        b.store.mget_h2d_from_multi_buffers.return_value = ["k2"]
         result = b.get(["k1", "k2", "k3"], [[100], [200], [300]], [[10], [20], [30]])
         self.assertEqual(result, [0, 1, 0])
 
     def test_get_failed_keys(self):
         b = self._make_backend()
-        b._hetero_client.mget_h2d.return_value = ["k1"]
+        b.store.mget_h2d_from_multi_buffers.return_value = ["k1"]
         result = b.get(["k1"], [[100]], [[10]])  # Should log error
         self.assertEqual(result, [1])
 
     def test_get_exception(self):
         b = self._make_backend()
-        b._hetero_client.mget_h2d.side_effect = Exception("fail")
-        result = b.get(["k1"], [[100]], [[10]])
+        b.store.mget_h2d_from_multi_buffers.side_effect = RuntimeError("backend fail")
+        with patch(
+            "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.yuanrong_backend.logger"
+        ) as mock_logger:
+            result = b.get(["k1"], [[100]], [[10]])
+        error_log = _format_log_call(mock_logger.error.call_args)
         self.assertIsNone(result)
-
-    def test_put_empty(self):
-        b = self._make_backend()
-        b.put([], [], [])
-        b._hetero_client.mset_d2h.assert_not_called()
+        self.assertIn("RuntimeError", error_log)
+        self.assertIn("backend fail", error_log)
 
     def test_put(self):
         b = self._make_backend()
         b.put(["k1"], [[100]], [[10]])
-        b._hetero_client.mset_d2h.assert_called_once()
+        b.store.mset_d2h_from_multi_buffers.assert_called_once_with(["k1"], [[100]], [[10]], b._ds_set_param)
 
     def test_put_exception(self):
         b = self._make_backend()
-        b._hetero_client.mset_d2h.side_effect = Exception("fail")
-        b.put(["k1"], [[100]], [[10]])
+        b.store.mset_d2h_from_multi_buffers.side_effect = RuntimeError("backend fail")
+        with patch(
+            "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.yuanrong_backend.logger"
+        ) as mock_logger:
+            b.put(["k1"], [[100]], [[10]])
+        error_log = _format_log_call(mock_logger.error.call_args)
+        self.assertIn("RuntimeError", error_log)
+        self.assertIn("backend fail", error_log)
 
     def test_register_buffer_noop_when_remote_h2d_disabled(self):
         b = self._make_backend()
         b.register_buffer([100], [200])
-        b._hetero_client.pre_register_device_memory.assert_not_called()
+        b.store.pre_register_device_memory.assert_not_called()
 
-    def test_register_buffer_when_remote_h2d_enabled(self):
+    def test_register_buffer_noop_when_pregister_toggle_off(self):
+        # HIXL conditions all met, but the enable_dev_mem_pregister toggle is
+        # false by default -> pre-registration is skipped. Mirrors the
+        # __init__ gating expression that ANDs in the toggle.
         b = self._make_backend()
         b.config.enable_remote_h2d = True
+        b.config.remote_h2d_transport_backend = "HIXL"
+        b.config.enable_fabric_mem = False
+        b.config.enable_dev_mem_pregister = False
+        b._needs_dev_mem_pregister = (
+            b.config.enable_remote_h2d
+            and b.config.remote_h2d_transport_backend == "HIXL"
+            and not b.config.enable_fabric_mem
+            and b.config.enable_dev_mem_pregister
+        )
         b.register_buffer([100], [200])
-        b._hetero_client.pre_register_device_memory.assert_called_once_with([100], [200])
+        b.store.pre_register_device_memory.assert_not_called()
 
-    def test_register_buffer_noop_on_a2(self):
-        # A2 must not register (opposite of memcache_backend's _is_a2 gating).
+    def test_register_buffer_when_remote_h2d_enabled_hixl(self):
         b = self._make_backend()
-        b._is_a2 = True
-        b.config.enable_remote_h2d = True
+        b._needs_dev_mem_pregister = True
         b.register_buffer([100], [200])
-        b._hetero_client.pre_register_device_memory.assert_not_called()
+        b.store.pre_register_device_memory.assert_called_once_with([100], [200])
+
+    def test_register_buffer_noop_when_p2p_transfer_link(self):
+        # P2P-Transfer RoCE transport backend does not use device memory pre-registration.
+        b = self._make_backend()
+        b.config.enable_remote_h2d = True
+        b.config.remote_h2d_transport_backend = "P2P_TRANSFER"
+        b._needs_dev_mem_pregister = False
+        b.register_buffer([100], [200])
+        b.store.pre_register_device_memory.assert_not_called()
+
+    def test_register_buffer_noop_when_fabric_mem(self):
+        # FabricMem mode relies on HIXL OPTION_ENABLE_USE_FABRIC_MEM for
+        # automatic Fabric handle exchange; no client-side MEM_DEVICE
+        # pre-registration. Mirrors the __init__ gating expression.
+        b = self._make_backend()
+        b.config.enable_remote_h2d = True
+        b.config.remote_h2d_transport_backend = "HIXL"
+        b.config.enable_fabric_mem = True
+        b._needs_dev_mem_pregister = (
+            b.config.enable_remote_h2d
+            and b.config.remote_h2d_transport_backend == "HIXL"
+            and not b.config.enable_fabric_mem
+        )
+        b.register_buffer([100], [200])
+        b.store.pre_register_device_memory.assert_not_called()
 
     def test_register_buffer_idempotent(self):
         b = self._make_backend()
-        b.config.enable_remote_h2d = True
+        b._needs_dev_mem_pregister = True
         b.register_buffer([100], [200])
         b.register_buffer([300], [400])
-        b._hetero_client.pre_register_device_memory.assert_called_once_with([100], [200])
+        b.store.pre_register_device_memory.assert_called_once_with([100], [200])
 
     def test_register_buffers_if_needed_no_buffers(self):
         b = self._make_backend()
-        b.config.enable_remote_h2d = True
+        b._needs_dev_mem_pregister = True
         b._registered_buffers = None
         b._register_buffers_if_needed()
-        b._hetero_client.pre_register_device_memory.assert_not_called()
+        b.store.pre_register_device_memory.assert_not_called()
 
     def test_register_buffers_if_needed_already_registered(self):
         b = self._make_backend()
-        b.config.enable_remote_h2d = True
+        b._needs_dev_mem_pregister = True
         b._registered_buffers = ([100], [200])
         b._buffers_registered = True
         b._register_buffers_if_needed()
-        b._hetero_client.pre_register_device_memory.assert_not_called()
+        b.store.pre_register_device_memory.assert_not_called()
 
     def test_register_buffers_if_needed_disabled(self):
         b = self._make_backend()
-        b.config.enable_remote_h2d = False
+        b._needs_dev_mem_pregister = False
         b._registered_buffers = ([100], [200])
         b._register_buffers_if_needed()
-        b._hetero_client.pre_register_device_memory.assert_not_called()
+        b.store.pre_register_device_memory.assert_not_called()
 
-    def test_ensure_device_ready(self):
-        b = self._make_backend()
-        b._helper._device_id = None
-        b.set_device = MagicMock()
-        b._ensure_device_ready()
-        b.set_device.assert_called_once()
 
-    def test_ensure_device_ready_already_set(self):
-        b = self._make_backend()
-        b._helper._device_id = 0
-        b.set_device = MagicMock()
-        b._ensure_device_ready()
-        b.set_device.assert_not_called()
+# =========================================================================
+# Memcache layerwise transfer protocol
+# =========================================================================
+_PROTOCOL_FUNCTIONS = (
+    "make_full_key",
+    "make_partial_key",
+    "make_hit_check_keys",
+    "extract_layout_config",
+)
+
+_LAYERWISE_STORE_METHODS = (
+    "batch_get_key_info",
+    "batch_alloc",
+    "batch_add_lease",
+    "batch_remove_lease",
+    "batch_write_finish",
+)
+
+
+class TestLayerwiseProtocolMemcacheExclusivity(unittest.TestCase):
+    """The memcache backend is the only layerwise protocol carrier.
+
+    Three views of the same fact must agree for every registered backend:
+    the module exposes the protocol functions, the class overrides the
+    five layerwise store calls (python's MRO: an override wins over the
+    inherited NotImplementedError stub), and the registry entry carries
+    the ``layerwise_protocol`` marker.
+    """
+
+    def _backend_entries(self):
+        import importlib
+
+        for name, entry in backend_map.items():
+            module = importlib.import_module(entry["path"])
+            yield name, entry, module, getattr(module, entry["name"])
+
+    def test_protocol_functions_store_overrides_and_registry_marker_agree(self):
+        for name, entry, module, backend_class in self._backend_entries():
+            with self.subTest(backend=name):
+                exposes_protocol = all(callable(getattr(module, func, None)) for func in _PROTOCOL_FUNCTIONS)
+                owns_overrides = all(
+                    any(method in vars(cls) for cls in backend_class.__mro__ if cls is not Backend)
+                    for method in _LAYERWISE_STORE_METHODS
+                )
+                self.assertEqual(exposes_protocol, name == "memcache")
+                self.assertEqual(owns_overrides, name == "memcache")
+                self.assertEqual(exposes_protocol, bool(entry.get("layerwise_protocol")))
+                self.assertEqual(owns_overrides, exposes_protocol)
+
+
+class TestExtractLayoutConfig(unittest.TestCase):
+    """The protocol owns the layerwise opt-in check of the layout layer."""
+
+    def test_returns_config_when_opted_in(self):
+        extra_config = {"use_layerwise": True, "layerwise_num_shared_buffers": 2}
+        self.assertIs(extract_layout_config(extra_config), extra_config)
+
+    def test_returns_none_when_not_opted_in(self):
+        self.assertIsNone(extract_layout_config({}))
+        self.assertIsNone(extract_layout_config({"use_layerwise": False}))
+
+
+class TestLayerwiseKeyFormats(unittest.TestCase):
+    """Byte-for-byte snapshots of the layerwise key formats.
+
+    These strings are wire formats shared with deployed clusters: a single
+    character of drift turns hits into misses after an upgrade. The
+    expectations are transcribed from the pre-refactor pool_worker /
+    pool_scheduler implementations.
+    """
+
+    def test_full_key_single_group_keeps_pr_11585_format(self):
+        self.assertEqual(
+            make_full_key("model", 0, "hash0", 3, 1),
+            "model@hash0@3",
+        )
+
+    def test_full_key_multi_group_includes_group_id(self):
+        self.assertEqual(
+            make_full_key("model", 2, "hash0", 3, 4),
+            "model@2@hash0@3",
+        )
+
+    def test_partial_key_format(self):
+        self.assertEqual(
+            make_partial_key("model", "r1", 0, 1, 20, 3),
+            "model@partial@r1@0@1@20@3",
+        )
+
+    def test_hit_check_keys_single_group_one_key_per_rank(self):
+        self.assertEqual(
+            make_hit_check_keys("model", 0, "hash0", 4, 1),
+            ["model@hash0@0", "model@hash0@1", "model@hash0@2", "model@hash0@3"],
+        )
+
+    def test_hit_check_keys_multi_group_one_key_per_rank(self):
+        self.assertEqual(
+            make_hit_check_keys("model", 1, "hash0", 2, 3),
+            ["model@1@hash0@0", "model@1@hash0@1"],
+        )
+
+    def test_hit_check_keys_empty_when_no_ranks(self):
+        self.assertEqual(make_hit_check_keys("model", 0, "hash0", 0, 1), [])
+
+    def test_full_key_and_hit_check_key_share_rank_format(self):
+        """The hit-check key of rank r must equal that rank's full key."""
+        for num_groups in (1, 2):
+            for rank in range(3):
+                with self.subTest(num_groups=num_groups, rank=rank):
+                    self.assertEqual(
+                        make_hit_check_keys("model", 0, "hash0", 3, num_groups)[rank],
+                        make_full_key("model", 0, "hash0", rank, num_groups),
+                    )
 
 
 # =========================================================================
 # MemcacheBackend (mocked store)
 # =========================================================================
+class TestMemcacheDPInitBarrier(unittest.TestCase):
+    def setUp(self):
+        stack = ExitStack()
+        self.addCleanup(stack.close)
+        self.store = MagicMock()
+        self.store.init.return_value = 0
+        self.group = SimpleNamespace(cpu_group=object())
+        self.get_dp_group = stack.enter_context(patch.object(memcache_module, "get_dp_group", return_value=self.group))
+        self.barrier = stack.enter_context(patch.object(memcache_module.torch.distributed, "barrier"))
+        stack.enter_context(patch.object(MemcacheBackend, "set_device"))
+        stack.enter_context(patch.object(memcache_module.time, "sleep"))
+        stack.enter_context(
+            patch.object(sys.modules["memcache_hybrid"], "DistributedObjectStore", return_value=self.store, create=True)
+        )
+
+    def make_backend(self, dp_init_barrier=True, dp_size=8, init_bm=True, lazy_init=False):
+        return MemcacheBackend(
+            SimpleNamespace(data_parallel_size=dp_size),
+            local_rank=0,
+            init_bm=init_bm,
+            lazy_init=lazy_init,
+            dp_init_barrier=dp_init_barrier,
+        )
+
+    def test_default_waits_on_cpu_group_after_successful_init(self):
+        calls = MagicMock()
+        calls.attach_mock(self.store.init, "init")
+        calls.attach_mock(self.barrier, "barrier")
+        backend = self.make_backend()
+        self.assertIs(backend.store, self.store)
+        self.assertEqual(
+            calls.mock_calls,
+            [unittest.mock.call.init(0, init_bm=True), unittest.mock.call.barrier(group=self.group.cpu_group)],
+        )
+
+    def test_explicit_enable(self):
+        self.make_backend(dp_init_barrier=True)
+        self.barrier.assert_called_once_with(group=self.group.cpu_group)
+
+    def test_disabled_single_dp_and_metadata_clients_skip_barrier(self):
+        for kwargs in ({"dp_init_barrier": False}, {"dp_size": 1}, {"init_bm": False}):
+            with self.subTest(**kwargs):
+                self.make_backend(**kwargs)
+                self.get_dp_group.assert_not_called()
+                self.barrier.assert_not_called()
+
+    def test_rejects_non_boolean_config_before_initialization(self):
+        for value in ("false", "true", 0, 1, None):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "memcache_dp_init_barrier.*boolean"):
+                self.make_backend(dp_init_barrier=value)
+        self.store.init.assert_not_called()
+        self.barrier.assert_not_called()
+
+    def test_failed_store_does_not_enter_barrier(self):
+        self.store.init.return_value = -1
+        with self.assertRaises(AssertionError):
+            self.make_backend()
+        self.get_dp_group.assert_not_called()
+        self.barrier.assert_not_called()
+
+    def test_store_exception_does_not_enter_barrier(self):
+        self.store.init.side_effect = RuntimeError("store init failed")
+        with self.assertRaisesRegex(RuntimeError, "store init failed"):
+            self.make_backend()
+        self.barrier.assert_not_called()
+
+    def test_lazy_initialization_does_not_synchronize(self):
+        with patch.object(memcache_module, "_is_device_sdma", return_value=True):
+            backend = self.make_backend(lazy_init=True)
+        self.store.init.assert_not_called()
+        self.barrier.assert_not_called()
+        backend.ensure_initialized()
+        backend.ensure_initialized()
+        self.store.init.assert_called_once_with(0, init_bm=True)
+        self.get_dp_group.assert_not_called()
+        self.barrier.assert_not_called()
+
+    def test_lazy_request_with_eager_backend_still_synchronizes(self):
+        with patch.object(memcache_module, "_is_device_sdma", return_value=False):
+            backend = self.make_backend(lazy_init=True)
+        self.assertFalse(backend._lazy_init)
+        self.store.init.assert_called_once_with(0, init_bm=True)
+        self.barrier.assert_called_once_with(group=self.group.cpu_group)
+        backend.ensure_initialized()
+        self.store.init.assert_called_once()
+        self.barrier.assert_called_once()
+
+
 class TestMemcacheBackendMethods(unittest.TestCase):
     def _make_backend(self):
         from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.memcache_backend import MemcacheBackend
@@ -591,9 +873,7 @@ class TestMemcacheBackendMethods(unittest.TestCase):
             # Set internal state to avoid lazy init logic during tests
             backend._lazy_init = False
             backend._store_initialized = True
-            backend._is_a2 = False
-            backend._registered_buffers = None
-            backend._buffers_registered = False
+            backend._pending_buffers = None
             return backend
 
     def test_exists(self):
@@ -603,9 +883,21 @@ class TestMemcacheBackendMethods(unittest.TestCase):
 
     def test_register_buffer(self):
         b = self._make_backend()
-        b._is_a2 = True
         b.register_buffer([100], [200])
         b.store.register_buffer.assert_called_once()
+
+    def test_batch_write_finish(self):
+        b = self._make_backend()
+        b.store.batch_write_finish.return_value = [0]
+
+        self.assertEqual(b.batch_write_finish(["k1"], [0]), [0])
+        b.store.batch_write_finish.assert_called_once_with(["k1"], [0])
+
+    def test_batch_write_finish_supports_legacy_store(self):
+        b = self._make_backend()
+        b.store = object()
+
+        self.assertEqual(b.batch_write_finish(["k1"], [0]), [0])
 
     def test_get(self):
         b = self._make_backend()
@@ -620,8 +912,14 @@ class TestMemcacheBackendMethods(unittest.TestCase):
 
     def test_get_exception(self):
         b = self._make_backend()
-        b.store.batch_get_into_layers.side_effect = Exception("fail")
-        b.get(["k1"], [[100]], [[10]])
+        b.store.batch_get_into_layers.side_effect = RuntimeError("backend fail")
+        with patch(
+            "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.memcache_backend.logger"
+        ) as mock_logger:
+            b.get(["k1"], [[100]], [[10]])
+        error_log = _format_log_call(mock_logger.error.call_args)
+        self.assertIn("RuntimeError", error_log)
+        self.assertIn("backend fail", error_log)
 
     def test_put(self):
         b = self._make_backend()
@@ -636,8 +934,14 @@ class TestMemcacheBackendMethods(unittest.TestCase):
 
     def test_put_exception(self):
         b = self._make_backend()
-        b.store.batch_put_from_layers.side_effect = Exception("fail")
-        b.put(["k1"], [[100]], [[10]])
+        b.store.batch_put_from_layers.side_effect = RuntimeError("backend fail")
+        with patch(
+            "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.memcache_backend.logger"
+        ) as mock_logger:
+            b.put(["k1"], [[100]], [[10]])
+        error_log = _format_log_call(mock_logger.error.call_args)
+        self.assertIn("RuntimeError", error_log)
+        self.assertIn("backend fail", error_log)
 
 
 if __name__ == "__main__":

@@ -25,19 +25,29 @@ from vllm.utils.mem_utils import MemorySnapshot, memory_profiling
 from vllm.utils.torch_utils import set_random_seed  # noqa: E402
 
 from vllm_ascend._310p.model_runner_310p import NPUModelRunner310
-from vllm_ascend.utils import is_rc_device, vllm_version_is
+from vllm_ascend.utils import is_rc_device
 from vllm_ascend.worker.worker import NPUWorker, init_workspace_manager
 
 
 class NPUWorker310(NPUWorker):
+    def _create_model_runner(self):
+        if self.use_v2_model_runner:
+            from vllm_ascend._310p.worker.v2.model_runner import NPUModelRunner310V2
+
+            model_runner = NPUModelRunner310V2(self.vllm_config, self.device)
+            logger.info_once("Using NPUWorker310 and NPUModelRunner310V2.")
+            return model_runner
+
+        model_runner = NPUModelRunner310(self.vllm_config, self.device)
+        logger.info_once("Using NPUWorker310 and NPUModelRunner310.")
+        return model_runner
+
     def init_device(self):
         self.device = self._init_device()
         torch_npu.npu.set_compile_mode(jit_compile=False)
 
         init_workspace_manager(self.device, num_ubatches=1)
-
-        self.model_runner = NPUModelRunner310(self.vllm_config, self.device)
-        logger.info_once("Using NPUWorker310 and NPUModelRunner310.")
+        self.model_runner = self._create_model_runner()
 
     def save_sharded_state(
         self,
@@ -138,10 +148,7 @@ class NPUWorker310(NPUWorker):
         torch.npu.empty_cache()
 
         # take current memory snapshot
-        if vllm_version_is("0.23.0"):
-            self.init_snapshot = MemorySnapshot()
-        else:
-            self.init_snapshot = MemorySnapshot(device=device)
+        self.init_snapshot = MemorySnapshot(device=device)
         self.requested_memory = self.init_snapshot.total_memory * self.cache_config.gpu_memory_utilization
         if is_rc_device():
             self.init_snapshot.free_memory = psutil.virtual_memory().available

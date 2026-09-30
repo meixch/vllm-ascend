@@ -23,6 +23,7 @@ Usage at the top of each test file:
     import tests.ut.distributed.ascend_store._mock_deps  # noqa: F401, E402
 """
 
+import importlib
 import importlib.util
 import logging
 import os
@@ -98,6 +99,7 @@ _vllm_mock_modules = [
     "vllm.v1.outputs",
     "vllm.v1.request",
     "vllm.v1.serial_utils",
+    "vllm.v1.worker",
 ]
 if _MOCK_VLLM_DEPS:
     for _mod_name in _vllm_mock_modules:
@@ -175,7 +177,11 @@ class _FakeKVCacheSpec:
         return self.block_size * num_kv_heads * head_size * int(dtype_size or 1) * 2
 
 
-class _FakeFullAttentionSpec(_FakeKVCacheSpec):
+class _FakeAttentionSpec(_FakeKVCacheSpec):
+    pass
+
+
+class _FakeFullAttentionSpec(_FakeAttentionSpec):
     pass
 
 
@@ -321,6 +327,7 @@ _single_type_mod.spec_manager_map = {  # type: ignore[attr-defined]
 
 _kv_interface_mod: Any = sys.modules["vllm.v1.kv_cache_interface"] if _MOCK_VLLM_DEPS else types.SimpleNamespace()
 _kv_interface_mod.KVCacheSpec = _FakeKVCacheSpec  # type: ignore[attr-defined]
+_kv_interface_mod.AttentionSpec = _FakeAttentionSpec  # type: ignore[attr-defined]
 _kv_interface_mod.FullAttentionSpec = _FakeFullAttentionSpec  # type: ignore[attr-defined]
 _kv_interface_mod.SlidingWindowSpec = _FakeSlidingWindowSpec  # type: ignore[attr-defined]
 _kv_interface_mod.MambaSpec = _FakeMambaSpec  # type: ignore[attr-defined]
@@ -376,11 +383,17 @@ def _make_pkg(name, path=""):
     return mod
 
 
-for _pkg in ["vllm_ascend", "vllm_ascend.distributed"]:
+_vllm_ascend_real_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "vllm_ascend"))
+_vllm_ascend_package_paths = {
+    "vllm_ascend": _vllm_ascend_real_path,
+    "vllm_ascend.distributed": os.path.join(_vllm_ascend_real_path, "distributed"),
+}
+for _pkg, _path in _vllm_ascend_package_paths.items():
     if _pkg not in sys.modules:
-        sys.modules[_pkg] = _make_pkg(_pkg)
+        sys.modules[_pkg] = _make_pkg(_pkg, _path)
 
 _distributed_utils = types.ModuleType("vllm_ascend.distributed.utils")
+_distributed_utils.all_gather_async = MagicMock()  # type: ignore[attr-defined]
 _distributed_utils.get_decode_context_model_parallel_rank = MagicMock(  # type: ignore[attr-defined]
     return_value=0
 )
@@ -389,15 +402,29 @@ _distributed_utils.get_decode_context_model_parallel_world_size = MagicMock(  # 
 )
 sys.modules["vllm_ascend.distributed.utils"] = _distributed_utils
 
-_kv_transfer_init = _make_pkg("vllm_ascend.distributed.kv_transfer")
-_kv_transfer_init.register_connector = MagicMock()  # type: ignore[attr-defined]
-sys.modules["vllm_ascend.distributed.kv_transfer"] = _kv_transfer_init
+_kv_transfer_real_path = os.path.join(_vllm_ascend_real_path, "distributed", "kv_transfer")
+if _MOCK_VLLM_DEPS:
+    _kv_transfer_init = _make_pkg("vllm_ascend.distributed.kv_transfer", _kv_transfer_real_path)
+    _kv_transfer_init.register_connector = MagicMock()  # type: ignore[attr-defined]
+    sys.modules["vllm_ascend.distributed.kv_transfer"] = _kv_transfer_init
+else:
+    # Preserve the real registration entry point when vLLM is installed. This
+    # helper is imported while pytest collects the ascend_store tests, so
+    # replacing the package here would leak a MagicMock into later KV-transfer
+    # tests in the same CPU-UT process.
+    _kv_transfer_init = importlib.import_module("vllm_ascend.distributed.kv_transfer")
 
-_kv_utils_pkg = _make_pkg("vllm_ascend.distributed.kv_transfer.utils")
+_kv_utils_pkg = _make_pkg(
+    "vllm_ascend.distributed.kv_transfer.utils",
+    os.path.join(_kv_transfer_real_path, "utils"),
+)
 sys.modules["vllm_ascend.distributed.kv_transfer.utils"] = _kv_utils_pkg
 sys.modules["vllm_ascend.distributed.kv_transfer.utils.mooncake_transfer_engine"] = MagicMock()
 
-_kv_pool_pkg = _make_pkg("vllm_ascend.distributed.kv_transfer.kv_pool")
+_kv_pool_pkg = _make_pkg(
+    "vllm_ascend.distributed.kv_transfer.kv_pool",
+    os.path.join(_kv_transfer_real_path, "kv_pool"),
+)
 sys.modules["vllm_ascend.distributed.kv_transfer.kv_pool"] = _kv_pool_pkg
 
 _ascend_store_real_path = os.path.join(
@@ -424,24 +451,24 @@ _backend_pkg = _make_pkg(
 )
 sys.modules["vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend"] = _backend_pkg
 
-# Mirror the real backend/__init__.py entry points. The scheduler/worker resolve
-# the backend class dynamically via ``importlib.import_module(path)``; tests that
-# exercise those paths patch ``<module>.importlib`` locally (see
-# test_pool_scheduler.py / test_pool_worker.py) so the backend resolves to a
-# MagicMock. Do NOT register the backends in sys.modules or globally wrap
-# import_module here: test_backend.py imports the real backend classes and also
-# relies on ``mock.patch`` (which itself calls importlib.import_module) resolving
+# Execute the real backend/__init__.py inside the stub package so that
+# backend_map always stays in sync with the source of truth. The stub
+# package shadows the real package for these tests; without this, any
+# ``from ...backend import backend_map`` in the real modules would fail
+# with ImportError under the stub. (Submodules such as
+# backend.memcache_backend resolve through the stub package's __path__ and
+# need no special casing.)
+# The scheduler/worker resolve the backend class dynamically via
+# ``importlib.import_module(path)``; tests that exercise those paths patch
+# ``<module>.importlib`` locally (see test_pool_scheduler.py /
+# test_pool_worker.py) so the backend resolves to a MagicMock. Do NOT
+# register the backends in sys.modules or globally wrap import_module here:
+# test_backend.py imports the real backend classes and also relies on
+# ``mock.patch`` (which itself calls importlib.import_module) resolving
 # those real modules.
-_backend_module_paths = {
-    "mooncake": "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.mooncake_backend",
-    "memcache": "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.memcache_backend",
-    "yuanrong": "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.yuanrong_backend",
-}
-_backend_pkg.backend_map = {  # type: ignore[attr-defined]
-    "mooncake": {"name": "MooncakeBackend", "path": _backend_module_paths["mooncake"]},
-    "memcache": {"name": "MemcacheBackend", "path": _backend_module_paths["memcache"]},
-    "yuanrong": {"name": "YuanrongBackend", "path": _backend_module_paths["yuanrong"]},
-}
+_backend_init_path = os.path.join(_backend_pkg.__path__[0], "__init__.py")  # type: ignore[attr-defined]
+with open(_backend_init_path, encoding="utf-8") as _backend_init_file:
+    exec(compile(_backend_init_file.read(), _backend_init_path, "exec"), vars(_backend_pkg))  # type: ignore[arg-type]
 
 if "vllm_ascend.utils" not in sys.modules or not hasattr(sys.modules["vllm_ascend.utils"], "AscendDeviceType"):
     _ascend_utils = MagicMock()
@@ -449,7 +476,7 @@ if "vllm_ascend.utils" not in sys.modules or not hasattr(sys.modules["vllm_ascen
     _ascend_utils.get_ascend_device_type = MagicMock()
     sys.modules["vllm_ascend.utils"] = _ascend_utils
 
-# NOTE: vllm_ascend.{ascend_config, memcache_comm_fence} and their helpers
+# NOTE: vllm_ascend.{ascend_config, attention_fence} and their helpers
 # (get_ascend_config, AttentionComputeStartGate, ...) are intentionally NOT
 # mocked here. Doing so by mutating these real modules leaks into every other
 # UT in the same pytest session (breaking test_ascend_config / test_platform,

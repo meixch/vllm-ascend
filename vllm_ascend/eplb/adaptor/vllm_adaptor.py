@@ -16,6 +16,7 @@
 #
 # Todo: Once https://github.com/vllm-project/vllm/issues/22246 is merged in vllm. Remove this adaptor.
 import json
+from inspect import getattr_static
 from typing import Any
 
 import torch
@@ -51,10 +52,20 @@ EPLB_EXPERT_WEIGHT_NAMES = {
         "w13_scale_bias_list",
         "w2_scale_bias_list",
     ),
-    (QuantType.MXFP4, False): ("w13_weight", "w2_weight", "w13_weight_scale", "w2_weight_scale"),
-    (QuantType.MXFP4, True): ("w13_weight", "w2_weight", "w13_weight_scale", "w2_weight_scale"),
-    (QuantType.MXFP8, False): ("w13_weight", "w2_weight", "w13_weight_scale", "w2_weight_scale"),
-    (QuantType.MXFP8, True): ("w13_weight", "w2_weight", "w13_weight_scale", "w2_weight_scale"),
+    (QuantType.W4A8, False): (
+        "w13_weight_list",
+        "w2_weight_list",
+        "w13_weight_scale_list",
+        "w2_weight_scale_list",
+        "w13_scale_bias_list",
+        "w2_scale_bias_list",
+    ),
+    (QuantType.W4A4MXFP, False): ("w13_weight", "w2_weight", "w13_weight_scale", "w2_weight_scale"),
+    (QuantType.W4A4MXFP, True): ("w13_weight", "w2_weight", "w13_weight_scale", "w2_weight_scale"),
+    (QuantType.W8A8MXFP, False): ("w13_weight", "w2_weight", "w13_weight_scale", "w2_weight_scale"),
+    (QuantType.W8A8MXFP, True): ("w13_weight", "w2_weight", "w13_weight_scale", "w2_weight_scale"),
+    # RFC extension: EPLB weight names for W4A8MXFP (mxfp C0_16) experts.
+    # Unlike QuantType.W4A8, the mxfp path has no scale-bias parameters.
     (QuantType.W4A8MXFP, False): (
         "w13_weight_list",
         "w2_weight_list",
@@ -168,7 +179,16 @@ class VllmEplbAdaptor:
             self.expert_param_per_layer[local_idx] = list()
             for name in expert_weight_names:
                 param_key = f"{local_idx}.{name}"
-                self.param_dict[param_key] = getattr(layer, name)
+                # Inspect the attribute without invoking __getattr__. Besides
+                # avoiding side effects from dynamic proxies, this prevents an
+                # unspecced MagicMock from fabricating the optional accessor.
+                # The refactored MoERunner declares the accessor because its
+                # RoutedExperts child owns weights; legacy layers expose them
+                # directly.
+                get_parameter = (
+                    layer.get_eplb_parameter if getattr_static(layer, "get_eplb_parameter", None) is not None else None
+                )
+                self.param_dict[param_key] = get_parameter(name) if get_parameter is not None else getattr(layer, name)
             for local_expert_id in range(self.num_local_experts):
                 per_expert_param = list()
                 for name in expert_weight_names:

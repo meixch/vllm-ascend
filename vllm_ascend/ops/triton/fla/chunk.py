@@ -14,9 +14,7 @@ import torch
 from einops import rearrange
 from vllm.distributed import get_pcp_group
 from vllm.forward_context import get_forward_context
-from vllm.model_executor.layers.fla.ops.utils import SUPPRESS_LEVEL
-
-from vllm_ascend.ops.gdn_attn_builder import _compact_empty_segments
+from vllm.third_party.flash_linear_attention.ops.utils import SUPPRESS_LEVEL
 
 from .chunk_delta_h import chunk_gated_delta_rule_fwd_h  # noqa: F401
 from .chunk_delta_hupdate import chunk_gated_delta_rule_fwd_hupdate
@@ -112,11 +110,8 @@ def chunk_gated_delta_rule_fwd(
             initial_state[keep_meta] if initial_state is not None and keep_meta is not None else initial_state
         )
     else:
-        cu_seqlens_kern, initial_state_kern, keep_meta = _compact_empty_segments(
-            cu_seqlens_host,
-            initial_state,
-            device=initial_state.device if initial_state is not None else None,
-        )
+        cu_seqlens_kern, initial_state_kern = cu_seqlens_host, initial_state
+        keep_meta = None
     h, v_new, final_state = torch.ops._C_ascend.chunk_gated_delta_rule_fwd_h(
         k_ascendc,
         w_ascendc,
@@ -167,7 +162,7 @@ def chunk_gated_delta_rule_fwd(
         updated_state = final_state.new_empty(get_pcp_group().world_size, *final_state.shape)
         updated_state[0, ...] = all_final_state[0]
         for i in range(1, get_pcp_group().world_size):
-            # correct_i = all_final_state[i] + Phi_i * (correct_{i-1} - s0)
+            # correct_i = all_final_state[i] + Φ_i · (correct_{i-1} - s0) = Φ_i · correct_{i-1} + p_i
             updated_final_state = all_final_state[i] + torch.matmul(
                 all_final_h_update[i, ...], updated_state[i - 1, ...] - initial_state
             )

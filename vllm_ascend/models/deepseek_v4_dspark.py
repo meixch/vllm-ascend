@@ -31,9 +31,9 @@ from vllm_ascend.ops.rope_dsv4 import RopeDataProxy, get_cos_and_sin_dsa
 from vllm_ascend.ops.triton.spec_decode.dspark_cache import dspark_masked_cache_store
 from vllm_ascend.utils import AscendDeviceType, enable_dsa_cp, get_ascend_device_type
 
-from .deepseek_v4 import (
+from .deepseek_v4.model import (
     DSV4_STACKED_PARAMS_MAPPING,
-    DeepseekV2DecoderLayer,
+    DeepseekV4DecoderLayer,
     DeepseekV2MixtureOfExperts,
     DeepseekV4Attention,
     _hc_head_torch,
@@ -596,7 +596,7 @@ class DeepseekV4DSparkAttention(DeepseekV4Attention):
         return self.wo_b(z)
 
 
-class DeepseekV4DSparkDecoderLayer(DeepseekV2DecoderLayer):
+class DeepseekV4DSparkDecoderLayer(DeepseekV4DecoderLayer):
     def __init__(self, vllm_config: VllmConfig, prefix: str) -> None:
         assert vllm_config.speculative_config is not None
         config = vllm_config.speculative_config.draft_model_config.hf_config
