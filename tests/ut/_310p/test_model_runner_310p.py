@@ -17,12 +17,14 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import numpy as np
 import torch
 from vllm.config import CUDAGraphMode
 from vllm.v1.kv_cache_interface import AttentionSpec, MambaSpec
 
 from tests.ut.base import TestBase
 from vllm_ascend._310p.model_runner_310p import NPUModelRunner310
+from vllm_ascend.attention.attention_v1 import AscendAttentionState
 
 
 def _prepare_inputs_source() -> str:
@@ -49,6 +51,8 @@ def test_prepare_inputs_keeps_aclgraph_metadata_on_cpu() -> None:
     assert "self._positions_cpu_buf[:total_num_scheduled_tokens]" in source
     assert "self.seq_lens[:num_reqs].copy_(" in source
     assert "self.optimistic_seq_lens_cpu[:num_reqs]" in source
+    assert "self._sync_num_accepted_tokens(" in source
+    assert "self.input_batch.num_accepted_tokens_cpu[" not in source
 
 
 def test_model_forward_updates_mtp_full_graph_params_before_replay() -> None:
@@ -65,6 +69,7 @@ def test_model_forward_updates_mtp_full_graph_params_before_replay() -> None:
         calls.append("update")
 
     def fake_model(**kwargs):
+        assert "is_dummy_run" not in kwargs
         calls.append("model")
         return torch.ones(1)
 
@@ -73,7 +78,6 @@ def test_model_forward_updates_mtp_full_graph_params_before_replay() -> None:
     forward_context = SimpleNamespace(
         cudagraph_runtime_mode=CUDAGraphMode.FULL,
         capturing=False,
-        flash_comm_v1_enabled=False,
     )
 
     with patch(
@@ -88,6 +92,35 @@ def test_model_forward_updates_mtp_full_graph_params_before_replay() -> None:
 
     assert calls == ["update", "model"]
     torch.testing.assert_close(hidden_states, torch.ones(1))
+
+
+def test_310p_runner_does_not_advertise_standardized_shared_kv_backing() -> None:
+    assert NPUModelRunner310.supports_standardized_shared_kv_backing is False
+
+
+def test_graph_dispatch_does_not_treat_later_prefill_chunk_as_decode() -> None:
+    runner = object.__new__(NPUModelRunner310)
+    runner.input_batch = SimpleNamespace(
+        num_computed_tokens_cpu=np.array([8], dtype=np.int32),
+        num_prompt_tokens=np.array([16], dtype=np.int32),
+    )
+    runner.attn_state = AscendAttentionState.DecodeOnly
+    runner.speculative_config = None
+
+    with patch(
+        "vllm_ascend.worker.model_runner_v1.NPUModelRunner._determine_batch_execution_and_padding",
+        return_value="dispatch-result",
+    ) as parent_dispatch:
+        result = runner._determine_batch_execution_and_padding(
+            num_tokens=1,
+            num_reqs=1,
+            num_scheduled_tokens_np=np.array([1], dtype=np.int32),
+            max_num_scheduled_tokens=1,
+            use_cascade_attn=False,
+        )
+
+    assert result == "dispatch-result"
+    assert parent_dispatch.call_args.kwargs["force_uniform_decode"] is None
 
 
 class TestNPUModelRunner310(TestBase):
@@ -131,7 +164,10 @@ class TestNPUModelRunner310(TestBase):
 
         with (
             patch("vllm_ascend._310p.model_runner_310p.NPUInputBatch") as mock_input_batch,
-            patch("vllm_ascend._310p.model_runner_310p.get_total_cp_world_size", return_value=1),
+            patch(
+                "vllm_ascend._310p.model_runner_310p.get_decode_context_model_parallel_world_size",
+                return_value=1,
+            ),
         ):
             runner.may_reinitialize_input_batch(kv_cache_config)
 
