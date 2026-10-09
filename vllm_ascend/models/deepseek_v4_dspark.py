@@ -8,6 +8,7 @@ from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch_npu
 from transformers import PretrainedConfig
 from vllm.compilation.decorators import support_torch_compile
@@ -31,14 +32,56 @@ from vllm_ascend.ops.rope_dsv4 import RopeDataProxy, get_cos_and_sin_dsa
 from vllm_ascend.ops.triton.spec_decode.dspark_cache import dspark_masked_cache_store
 from vllm_ascend.utils import AscendDeviceType, enable_dsa_cp, get_ascend_device_type
 
-from .deepseek_v4 import (
-    DSV4_STACKED_PARAMS_MAPPING,
-    DeepseekV2DecoderLayer,
+from .deepseek_v4.model import (
     DeepseekV2MixtureOfExperts,
     DeepseekV4Attention,
-    _hc_head_torch,
-    _normalize_dsv4_layer_weight_name,
+    DeepseekV4DecoderLayer,
 )
+
+# Compat block after the main-branch merge turned vllm_ascend.models.deepseek_v4
+# from a flat module into a package: main renamed DeepseekV2DecoderLayer to
+# DeepseekV4DecoderLayer (same constructor signature) and dropped the DSV4
+# weight-name helpers that only this DSpark draft model consumes.
+DeepseekV2DecoderLayer = DeepseekV4DecoderLayer
+
+DSV4_STACKED_PARAMS_MAPPING = (
+    ("gate_up_proj", "gate_proj", 0),
+    ("gate_up_proj", "up_proj", 1),
+)
+
+
+def _normalize_dsv4_layer_weight_name(
+    name: str,
+    *,
+    preserve_wo_a_scale: bool = False,
+) -> str:
+    name = name.replace(".w1.", ".gate_proj.")
+    name = name.replace(".w2.", ".down_proj.")
+    name = name.replace(".w3.", ".up_proj.")
+    name = name.replace(".attn.", ".self_attn.")
+    name = name.replace(".ffn_norm.", ".post_attention_layernorm.")
+    name = name.replace(".attn_norm.", ".input_layernorm.")
+    name = name.replace(".ffn.", ".mlp.")
+    if name.endswith(".scale") and not (preserve_wo_a_scale and name.endswith(".self_attn.wo_a.scale")):
+        name = name.removesuffix(".scale") + ".weight_scale"
+    return name.replace(".gate.bias", ".gate.e_score_correction_bias")
+
+
+def _hc_head_torch(
+    x: torch.Tensor,
+    hc_fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    norm_eps: float,
+    hc_eps: float,
+) -> torch.Tensor:
+    shape, dtype = x.size(), x.dtype
+    x_flat = x.flatten(1).float()
+    rsqrt = torch.rsqrt(x_flat.square().mean(-1, keepdim=True) + norm_eps)
+    mixes = F.linear(x_flat, hc_fn) * rsqrt
+    pre = torch.sigmoid(mixes * hc_scale + hc_base) + hc_eps
+    y = torch.sum(pre.unsqueeze(-1) * x_flat.view(shape), dim=1)
+    return y.to(dtype)
 
 DSPARK_WO_A_DEQUANT_BLOCK_SIZE = 128
 DSPARK_DEFAULT_BLOCK_SIZE = 5
