@@ -412,9 +412,14 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         self.attn_layer_names = list(sorted(self._draft_attn_layer_names))
         draft_attn_layers_dict = get_layers_from_vllm_config(self.vllm_config, AttentionLayerBase)
         # initialized for mamba models
-        self.kernel_block_size = (
+        kernel_block_size = (
             draft_attn_layers_dict[self.attn_layer_names[0]].get_attn_backend().get_supported_kernel_block_sizes()[0]
         )
+        # Newer vLLM returns a MultipleOf constraint object instead of a plain
+        # int; normalize it so downstream arithmetic and logging see an int.
+        if hasattr(kernel_block_size, "base"):
+            kernel_block_size = kernel_block_size.base
+        self.kernel_block_size = kernel_block_size
 
         # Sliding-window draft attention adapter.
         # Read from the validated AscendConfig singleton instead of bypassing it
