@@ -19,6 +19,7 @@ from vllm_ascend.ops.triton.quantize_mxfp4_indexer import (
     write_mxfp4_indexer_cache,
 )
 from vllm_ascend.precision_probe import plog
+from vllm_ascend.utils import resolve_wheel_op
 from vllm_ascend.worker.device_metadata import DeviceMetadataStage, wait_for_device_metadata
 
 
@@ -381,7 +382,7 @@ def write_attention_cache(
     else:
         raise ValueError(f"unsupported A5 cache kind: {kind}")
     plog("KV_WRITE_IN", kind, group_size, quant_mode, values, flat_slots)
-    torch.ops.custom.kv_compress_epilog_v2(
+    resolve_wheel_op("kv_compress_epilog_v2")(
         cache_arg,
         values.contiguous(),
         flat_slots.contiguous(),

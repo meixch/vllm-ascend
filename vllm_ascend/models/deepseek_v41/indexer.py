@@ -4,7 +4,6 @@
 
 import torch
 import torch_npu
-from cann_ops_transformer.ops.ds41 import indexer_prologue_k
 from torch import nn
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import ReplicatedLinear
@@ -155,6 +154,8 @@ class DeepseekV41Indexer(nn.Module):
             plog("IDX_K_CACHE_IN", k_cache, scale_cache, slots)
             # storage_mode=0 writes the separated K/scale planes (QLI view);
             # the operator folds rows internally for storage_mode=1.
+            from cann_ops_transformer.ops.ds41 import indexer_prologue_k
+
             indexer_prologue_k(
                 k_cache=k_cache,
                 k_scale_cache=scale_cache,

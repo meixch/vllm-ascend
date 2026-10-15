@@ -24,6 +24,7 @@ import json
 import math
 import os
 from contextlib import contextmanager, nullcontext
+from contextlib import suppress as contextlib_suppress
 from functools import lru_cache
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -404,6 +405,31 @@ def maybe_trans_nz(
     if input_dtype is not None:
         kwargs["input_dtype"] = input_dtype
     return torch_npu.npu_format_cast(weight, ACL_FORMAT_FRACTAL_NZ, **kwargs)
+
+
+def resolve_wheel_op(op_name: str):
+    """Resolve an operator registered by an installed operator wheel.
+
+    Tries the ``custom_ops`` wheel namespace first (``torch.ops.custom.*``,
+    the dsnext ABI) and falls back to ``torch.ops.cann_ops_transformer.*``
+    used by newer wheel generations. Importing the wheels is deferred to
+    call time so vLLM's subprocess model-registry inspection, which only
+    imports modules, never requires them.
+    """
+    with contextlib_suppress(ImportError):
+        import custom_ops  # noqa: F401  # Registers torch.ops.custom.* from the wheel.
+    with contextlib_suppress(ImportError):
+        import cann_ops_transformer  # noqa: F401  # Registers torch.ops.cann_ops_transformer.*
+    for namespace in ("custom", "cann_ops_transformer"):
+        op = getattr(getattr(torch.ops, namespace, None), op_name, None)
+        if op is not None:
+            return op
+    raise RuntimeError(
+        f"Operator '{op_name}' was not registered by any installed operator wheel: "
+        "expected torch.ops.custom.* from the custom_ops wheel or "
+        "torch.ops.cann_ops_transformer.* from the cann_ops_transformer wheel. "
+        "Install the dsnext operator wheels to serve DeepSeek V4.1."
+    )
 
 
 def maybe_trans_nz_with_scale(
