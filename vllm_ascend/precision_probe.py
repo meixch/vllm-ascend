@@ -40,6 +40,10 @@ import torch
 _ENABLED: bool | None = None
 _COUNTER = 0
 PROBE_HEAD_ELEMENTS = 8
+# Statistics are computed over at most this many elements: large caches fall
+# back to a deterministic leading prefix so probe memory stays bounded even if
+# a backend reduction materializes a cast of its input.
+PROBE_FULL_STAT_LIMIT = 1 << 24
 
 
 def _enabled() -> bool:
@@ -68,6 +72,22 @@ def _head(t: torch.Tensor, n: int = PROBE_HEAD_ELEMENTS) -> list | None:
         return None
 
 
+def _stat_tensor(t: torch.Tensor) -> tuple[torch.Tensor, bool]:
+    """Return a bounded tensor for statistics plus whether it was truncated."""
+    if t.numel() <= PROBE_FULL_STAT_LIMIT:
+        return t, False
+    if t.is_contiguous():
+        return t.view(-1)[:PROBE_FULL_STAT_LIMIT], True
+    takes: list[int] = []
+    remaining = PROBE_FULL_STAT_LIMIT
+    for size in reversed(t.shape):
+        take = min(int(size), remaining)
+        takes.append(take)
+        remaining = max(1, remaining // max(1, take))
+    idx = tuple(slice(0, take) for take in reversed(takes))
+    return t[idx].reshape(-1), True
+
+
 def _describe(value) -> str:
     if value is None:
         return "None"
@@ -79,18 +99,18 @@ def _describe(value) -> str:
         if t.numel() == 0:
             return header + ", empty)"
         head = _head(t)
-        # Reduce on the original tensor with an explicit accumulator dtype so
-        # no full-size temporary is ever allocated (KV caches are huge and the
-        # NPU is already nearly full from cache allocation).
-        if t.is_floating_point():
-            total = t.sum(dtype=torch.float32).item()
+        stat, truncated = _stat_tensor(t)
+        if stat.is_floating_point():
+            total = stat.sum(dtype=torch.float32).item()
             stats = (
-                f"min={t.min().item():.6g}, max={t.max().item():.6g}"
-                + f", mean={total / t.numel():.6g}, sum={total:.6g}"
+                f"min={stat.min().item():.6g}, max={stat.max().item():.6g}"
+                + f", mean={total / stat.numel():.6g}, sum={total:.6g}"
             )
         else:
-            total = t.sum(dtype=torch.int64).item()
-            stats = f"min={t.min().item()}, max={t.max().item()}, sum={total}"
+            total = stat.sum(dtype=torch.int64).item()
+            stats = f"min={stat.min().item()}, max={stat.max().item()}, sum={total}"
+        if truncated:
+            stats += f", sampled={stat.numel()}/{t.numel()}"
         return header + f", {stats}, head={head})"
     except Exception as exc:  # noqa: BLE001
         return header + f", probe-error={exc!r})"
