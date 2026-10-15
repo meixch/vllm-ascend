@@ -39,6 +39,7 @@ import torch
 
 _ENABLED: bool | None = None
 _COUNTER = 0
+PROBE_HEAD_ELEMENTS = 8
 
 
 def _enabled() -> bool:
@@ -52,6 +53,21 @@ def _enabled() -> bool:
     return _ENABLED
 
 
+def _head(t: torch.Tensor, n: int = PROBE_HEAD_ELEMENTS) -> list | None:
+    """Sample the first ``n`` elements without materializing a full copy."""
+    try:
+        if t.is_contiguous():
+            sample = t.view(-1)[:n]
+        else:
+            block = tuple(slice(0, min(size, 2)) for size in t.shape)
+            sample = t[block].reshape(-1)[:n]
+        if sample.is_floating_point():
+            return sample.to(torch.float32).tolist()
+        return sample.tolist()
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _describe(value) -> str:
     if value is None:
         return "None"
@@ -62,17 +78,20 @@ def _describe(value) -> str:
         t = value.detach()
         if t.numel() == 0:
             return header + ", empty)"
+        head = _head(t)
+        # Reduce on the original tensor with an explicit accumulator dtype so
+        # no full-size temporary is ever allocated (KV caches are huge and the
+        # NPU is already nearly full from cache allocation).
         if t.is_floating_point():
-            f = t.to(torch.float32)
-            head = f.flatten()[:8].tolist()
-            return (
-                header
-                + f", min={f.min().item():.6g}, max={f.max().item():.6g}"
-                + f", mean={f.mean().item():.6g}, sum={f.sum().item():.6g}"
-                + f", head={head})"
+            total = t.sum(dtype=torch.float32).item()
+            stats = (
+                f"min={t.min().item():.6g}, max={t.max().item():.6g}"
+                + f", mean={total / t.numel():.6g}, sum={total:.6g}"
             )
-        i = t.to(torch.int64)
-        return header + f", min={i.min().item()}, max={i.max().item()}, head={i.flatten()[:16].tolist()})"
+        else:
+            total = t.sum(dtype=torch.int64).item()
+            stats = f"min={t.min().item()}, max={t.max().item()}, sum={total}"
+        return header + f", {stats}, head={head})"
     except Exception as exc:  # noqa: BLE001
         return header + f", probe-error={exc!r})"
 
