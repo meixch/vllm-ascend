@@ -4,6 +4,7 @@
 
 import torch
 import torch_npu
+from cann_ops_transformer.ops.ds41 import indexer_prologue_k
 from torch import nn
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import ReplicatedLinear
@@ -14,15 +15,16 @@ from vllm_ascend.attention.dsa_v41 import (
 )
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.models.deepseek_v41.cache_config import (
+    INDEX_FOLD_ROWS,
     make_folded_index_cache_spec,
     make_index_cache_spec,
     uses_a5_packed_cache,
 )
-from vllm_ascend.ops.triton.fold_indexer_cache import fold_indexer_cache_rows
+from vllm_ascend.models.deepseek_v41.mixed_quant_attention import quantize_query_mxfp4
 from vllm_ascend.ops.triton.prepare_indexer_indices import prepare_indexer_indices
 from vllm_ascend.ops.triton.quantize_indexer_query import quantize_indexer_query
-from vllm_ascend.ops.triton.quantize_mxfp4_indexer import quantize_mxfp4_indexer
 from vllm_ascend.precision_probe import plog
+from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ, maybe_trans_nz
 from vllm_ascend.worker.device_metadata import (
     DeviceMetadataStage,
     wait_for_device_metadata,
@@ -54,6 +56,10 @@ class DeepseekV41Indexer(nn.Module):
         self.width = int(config.index_head_dim)
         self.rope_width = int(config.qk_rope_head_dim)
         self.index_topk = int(config.index_topk)
+        self.candidate_block_size = int(getattr(config, "candidate_block_size", INDEX_FOLD_ROWS))
+        # FP32 copy of the K RMSNorm weight for ``indexer_prologue_k``; stays
+        # ``None`` until ``process_weights_after_loading`` runs.
+        self._prologue_norm_weight: torch.Tensor | None = None
         self.softmax_scale = self.width**-0.5
         self.weights_scale = self.softmax_scale * self.n_heads**-0.5
         self.wq_b = ReplicatedLinear(
@@ -104,25 +110,82 @@ class DeepseekV41Indexer(nn.Module):
         output = linear(value)
         return output[0] if isinstance(output, tuple) else output
 
+    def process_weights_after_loading(self):
+        """Prepare the fused indexer_prologue_k operands after weight loading."""
+        if not self.owns_k:
+            return
+        weight = maybe_trans_nz(self.wk.weight.data)
+        if self.packed_cache_ops is not None and torch_npu.get_npu_format(weight) != ACL_FORMAT_FRACTAL_NZ:
+            raise RuntimeError(
+                "V4.1 indexer_prologue_k requires an Nz wk weight; start "
+                "with --additional-config '{\"weight_nz_mode\": 2}' (A5 "
+                "defaults to mode 1, which leaves BF16 weights in ND)"
+            )
+        self.wk.weight.data = weight
+        self._prologue_norm_weight = self.k_norm.weight.detach().to(torch.float32)
+
     def update_keys(self, latent, slots, cos, sin):
         """Publish source-owned index K before latent is RoPE'd as long KV."""
         if not self.owns_k or latent.shape[0] == 0:
             return
         plog("IDX_K_LATENT", latent, slots, cos, sin)
+        k_cache, scale_cache = self.k_cache.kv_cache[0]
+        if self.packed_cache_ops is not None:
+            if slots.ndim == 1:
+                # Builder-prepared flat slots; identical to converting the
+                # [T, 2] mapping per call, computed once per cache group.
+                slot_mapping = slots
+            elif slots.ndim == 2:
+                slot_mapping = (slots[:, 0]) * k_cache.shape[1] + slots[:, 1]
+                slot_mapping = slot_mapping.clamp(min=-1).to(torch.int32)
+            else:
+                raise ValueError(f"indexer update_keys slot mapping must be [T, 2] or [T], got ndim={slots.ndim}")
+            cache_index = slot_mapping.to(torch.int64)
+            norm_weight = self._prologue_norm_weight
+            if norm_weight is None:
+                norm_weight = self.k_norm.weight.float()
+            prologue_common = dict(
+                latent=latent,
+                wk=self.wk.weight.detach(),
+                norm_weight=norm_weight,
+                rope_sin=sin.reshape(-1, self.rope_width),
+                rope_cos=cos.reshape(-1, self.rope_width),
+                norm_eps=self.k_norm.eps,
+            )
+            plog("IDX_K_CACHE_IN", k_cache, scale_cache, slots)
+            # storage_mode=0 writes the separated K/scale planes (QLI view);
+            # the operator folds rows internally for storage_mode=1.
+            indexer_prologue_k(
+                k_cache=k_cache,
+                k_scale_cache=scale_cache,
+                cache_index=cache_index,
+                storage_mode=0,
+                combined_block_size=-1,
+                **prologue_common,
+            )
+            if self.k_cache_folded is not None:
+                if self.candidate_block_size != INDEX_FOLD_ROWS:
+                    raise ValueError(
+                        f"folded cache packs {INDEX_FOLD_ROWS} rows per row but "
+                        f"candidate_block_size is {self.candidate_block_size}; the ds41 "
+                        "prologue folds one candidate block per folded row"
+                    )
+                indexer_prologue_k(
+                    k_cache=self.k_cache_folded.kv_cache[0],
+                    k_scale_cache=None,
+                    cache_index=cache_index,
+                    storage_mode=1,
+                    combined_block_size=self.candidate_block_size,
+                    **prologue_common,
+                )
+                plog("IDX_K_FOLD_OUT", self.k_cache_folded.kv_cache[0])
+            plog("IDX_K_CACHE_OUT", k_cache, scale_cache)
+            return
         key = self.k_norm(self.wk(latent)).view(-1, 1, self.width)
         plog("IDX_K_PROJ", key)
         DeviceOperator.apply_partial_rotary_inplace(key, cos, sin, start=self.width - self.rope_width, end=self.width)
         key = key.squeeze(1)
         plog("IDX_K_ROPE", key)
-        k_cache, scale_cache = self.k_cache.kv_cache[0]
-        if self.packed_cache_ops is not None:
-            plog("IDX_K_CACHE_IN", k_cache, scale_cache, slots, key)
-            self.packed_cache_ops.write_index_cache((k_cache, scale_cache), slots, key)
-            if self.k_cache_folded is not None:
-                fold_indexer_cache_rows((k_cache, scale_cache), self.k_cache_folded.kv_cache[0], slots)
-                plog("IDX_K_FOLD_OUT", self.k_cache_folded.kv_cache[0])
-            plog("IDX_K_CACHE_OUT", k_cache, scale_cache)
-            return
         quantized, scale = torch_npu.npu_dynamic_quant(key, dst_type=torch.int8)
         scatter_cache_sk(k_cache, slots, quantized)
         scatter_cache_sk(
@@ -185,7 +248,7 @@ class DeepseekV41Indexer(nn.Module):
 
     def quantize_query(self, query):
         if self.packed_cache_ops is not None:
-            return quantize_mxfp4_indexer(query)
+            return quantize_query_mxfp4(query)
         return quantize_indexer_query(query)
 
     def select_projected(

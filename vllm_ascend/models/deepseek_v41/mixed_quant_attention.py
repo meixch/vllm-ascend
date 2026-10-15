@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import torch
+import torch_npu
 
 from vllm_ascend.ops import packaged_attention as ops
 from vllm_ascend.ops.triton.build_window_indices import (
@@ -15,11 +16,24 @@ from vllm_ascend.ops.triton.prepare_indexer_indices import (
     prepare_indexer_indices,
 )
 from vllm_ascend.ops.triton.quantize_mxfp4_indexer import (
-    quantize_mxfp4_indexer,
     write_mxfp4_indexer_cache,
 )
 from vllm_ascend.precision_probe import plog
 from vllm_ascend.worker.device_metadata import DeviceMetadataStage, wait_for_device_metadata
+
+
+def quantize_query_mxfp4(query: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize the indexer query to MXFP4 with the native NPU dynamic op.
+
+    Returns packed E2M1 data ``[T, H, width/2]`` (uint8) and E8M0 scales
+    ``[T, H, width/32]`` (uint8), matching the ds41 indexer operand layout.
+    """
+    n_heads = query.shape[-2]
+    width = query.shape[-1]
+    quantized, scale = torch_npu.npu_dynamic_mx_quant(query, dst_type=torch_npu.float4_e2m1fn_x2)
+    quantized = quantized.view(torch.uint8).reshape(-1, n_heads, width // 2)
+    scale = scale.contiguous().view(torch.uint8).reshape(quantized.shape[0], n_heads, width // 32)
+    return quantized, scale
 
 
 def _common(query, weights, source_cache, source_metadata, compress_ratio, quantized_query, query_scale):
@@ -29,7 +43,7 @@ def _common(query, weights, source_cache, source_metadata, compress_ratio, quant
     wait_for_device_metadata(DeviceMetadataStage.INDEXER, id(op_metadata))
     plog("QLI_META_CONSUME", op_metadata)
     if quantized_query is None:
-        quantized_query, query_scale = quantize_mxfp4_indexer(query)
+        quantized_query, query_scale = quantize_query_mxfp4(query)
     plog("IDX_Q_QUANT", quantized_query, query_scale)
     query_start_loc = source_metadata.query_start_loc
     qs = query_scale.unflatten(-1, (2, 2)).contiguous()
@@ -367,7 +381,7 @@ def write_attention_cache(
     else:
         raise ValueError(f"unsupported A5 cache kind: {kind}")
     plog("KV_WRITE_IN", kind, group_size, quant_mode, values, flat_slots)
-    torch.ops._C_ascend.kv_compress_epilog_v2(
+    torch.ops.custom.kv_compress_epilog_v2(
         cache_arg,
         values.contiguous(),
         flat_slots.contiguous(),

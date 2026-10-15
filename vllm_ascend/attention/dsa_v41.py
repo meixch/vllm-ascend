@@ -523,13 +523,10 @@ class AscendDSAV41Impl:
             state_metadata = compressor_metadata.state
             if state_metadata.c2_metadata_group_id is not None:
                 wait_for_device_metadata(DeviceMetadataStage.COMPRESSOR, state_metadata.c2_metadata_group_id)
-            hidden_states_fp32 = hidden_states.float()
-            # Finish the input cast before query quantization starts on the
-            # auxiliary stream, so the WKV matmul can overlap that quantization.
+            # The fused ds41 compressor op takes the raw hidden_states; the
+            # wkv/wgate projection and gated pooling happen inside the op.
             self._quantize_indexer_query(attn, prepared_indexer, metadata)
-            kv = compressor.wkv(hidden_states_fp32)
-            score = compressor.wgate(hidden_states_fp32)
-            latent = compressor.pool_projected(kv, score, state_metadata)
+            latent = compressor.pool_projected(hidden_states, state_metadata)
             source_cos = state_metadata.c2_source_cos
             source_sin = state_metadata.c2_source_sin
             if source_cos is None or source_sin is None:
