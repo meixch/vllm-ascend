@@ -22,6 +22,7 @@ from vllm_ascend.ops.triton.fold_indexer_cache import fold_indexer_cache_rows
 from vllm_ascend.ops.triton.prepare_indexer_indices import prepare_indexer_indices
 from vllm_ascend.ops.triton.quantize_indexer_query import quantize_indexer_query
 from vllm_ascend.ops.triton.quantize_mxfp4_indexer import quantize_mxfp4_indexer
+from vllm_ascend.precision_probe import plog
 from vllm_ascend.worker.device_metadata import (
     DeviceMetadataStage,
     wait_for_device_metadata,
@@ -107,14 +108,20 @@ class DeepseekV41Indexer(nn.Module):
         """Publish source-owned index K before latent is RoPE'd as long KV."""
         if not self.owns_k or latent.shape[0] == 0:
             return
+        plog("IDX_K_LATENT", latent, slots, cos, sin)
         key = self.k_norm(self.wk(latent)).view(-1, 1, self.width)
+        plog("IDX_K_PROJ", key)
         DeviceOperator.apply_partial_rotary_inplace(key, cos, sin, start=self.width - self.rope_width, end=self.width)
         key = key.squeeze(1)
+        plog("IDX_K_ROPE", key)
         k_cache, scale_cache = self.k_cache.kv_cache[0]
         if self.packed_cache_ops is not None:
+            plog("IDX_K_CACHE_IN", k_cache, scale_cache, slots, key)
             self.packed_cache_ops.write_index_cache((k_cache, scale_cache), slots, key)
             if self.k_cache_folded is not None:
                 fold_indexer_cache_rows((k_cache, scale_cache), self.k_cache_folded.kv_cache[0], slots)
+                plog("IDX_K_FOLD_OUT", self.k_cache_folded.kv_cache[0])
+            plog("IDX_K_CACHE_OUT", k_cache, scale_cache)
             return
         quantized, scale = torch_npu.npu_dynamic_quant(key, dst_type=torch.int8)
         scatter_cache_sk(k_cache, slots, quantized)
@@ -145,8 +152,11 @@ class DeepseekV41Indexer(nn.Module):
     ):
         """Score index K, optionally filter blocks, then return position TopK."""
         query = self.project_query(qr)
+        plog("IDX_Q_PROJ", query)
         self.apply_query_rope(query, cos, sin)
+        plog("IDX_Q_ROPE", query)
         weights = self.project_weights(hidden_states)
+        plog("IDX_Q_WEIGHTS", weights)
 
         return self.select_projected(
             query,

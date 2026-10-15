@@ -112,6 +112,11 @@ env_variables: dict[str, Callable[[], Any]] = {
     # a single topk + compact-space computation to reduce sampling latency
     # on large vocabularies (V>=150k). This variable is not sensitive.
     "VLLM_ASCEND_SAMPLER_FORCE_TOPK": lambda: int(os.getenv("VLLM_ASCEND_SAMPLER_FORCE_TOPK", "0")),
+    # Print tensor summaries at DeepSeek V4.1 A5 operator boundaries for
+    # before/after precision comparison of the dsnext operator replacement.
+    # 0=disabled (default), 1=print probe lines prefixed with "[PP #nnn]".
+    # Diagnostic only: the probes synchronize the device at every boundary.
+    "VLLM_ASCEND_PRECISION_PROBE": lambda: bool(int(os.getenv("VLLM_ASCEND_PRECISION_PROBE", "0"))),
 }
 
 # end-env-vars-definition

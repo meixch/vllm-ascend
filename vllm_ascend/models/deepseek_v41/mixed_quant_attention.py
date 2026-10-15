@@ -18,6 +18,7 @@ from vllm_ascend.ops.triton.quantize_mxfp4_indexer import (
     quantize_mxfp4_indexer,
     write_mxfp4_indexer_cache,
 )
+from vllm_ascend.precision_probe import plog
 from vllm_ascend.worker.device_metadata import DeviceMetadataStage, wait_for_device_metadata
 
 
@@ -26,15 +27,31 @@ def _common(query, weights, source_cache, source_metadata, compress_ratio, quant
     if op_metadata is None:
         raise RuntimeError("A5 QLI metadata was not built")
     wait_for_device_metadata(DeviceMetadataStage.INDEXER, id(op_metadata))
+    plog("QLI_META_CONSUME", op_metadata)
     if quantized_query is None:
         quantized_query, query_scale = quantize_mxfp4_indexer(query)
+    plog("IDX_Q_QUANT", quantized_query, query_scale)
     query_start_loc = source_metadata.query_start_loc
+    qs = query_scale.unflatten(-1, (2, 2)).contiguous()
+    w = weights.float().contiguous()
+    k = source_cache[0]
+    ks = source_cache[1].unflatten(-1, (2, 2))
+    plog(
+        "IDX_COMMON",
+        qs,
+        w,
+        k,
+        ks,
+        query_start_loc,
+        source_metadata.cache_seq_lens,
+        source_metadata.block_table,
+    )
     return (
         quantized_query,
-        query_scale.unflatten(-1, (2, 2)).contiguous(),
-        weights.float().contiguous(),
-        source_cache[0],
-        source_cache[1].unflatten(-1, (2, 2)),
+        qs,
+        w,
+        k,
+        ks,
         dict(
             cu_seqlens_q=query_start_loc,
             seqused_k=source_metadata.cache_seq_lens,
@@ -79,6 +96,7 @@ def _qli(
         query_scale,
     )
     common["layout_k"] = "PA_BBND"
+    plog("QLI_IN", q, k, w, qs, ks, topk, is_candidate_source, candidate_topk_blocks, candidate_block_size)
     indices, _, candidate_out, candidate_length = ops.quant_lightning_indexer(
         q,
         k,
@@ -91,6 +109,7 @@ def _qli(
         candidate_block_size=(candidate_block_size if is_candidate_source else -1),
         **common,
     )
+    plog("QLI_OUT", indices, candidate_out, candidate_length)
     if is_candidate_source:
         candidate_lengths.copy_(candidate_length)
     selected = prepare_indexer_indices(
@@ -100,6 +119,7 @@ def _qli(
         lengths_output=topk_lengths,
         indices_output=indices_output,
     )
+    plog("IDX_SELECT_POST", selected, topk_lengths)
     return selected, candidate_out if is_candidate_source else candidates
 
 
@@ -132,6 +152,7 @@ def _qsli(
         query_scale,
     )
     common.pop("metadata")
+    plog("QSLI_META_IN", candidate_lengths, source_metadata.num_reqs, topk, candidate_block_size)
     metadata = ops.quant_sparse_lightning_indexer_metadata(
         candidate_lengths,
         cu_seqlens_q=common["cu_seqlens_q"],
@@ -151,8 +172,10 @@ def _qsli(
         layout_q="TND",
         layout_k="PA_BBND",
     )
+    plog("QSLI_META_OUT", metadata)
     common["metadata"] = metadata
     common["layout_k"] = "PA_BBND"
+    plog("QSLI_IN", q, source_cache[2].squeeze(2), w, qs, candidates, candidate_lengths, topk, candidate_block_size)
     indices, _ = ops.quant_sparse_lightning_indexer(
         q,
         source_cache[2].squeeze(2),
@@ -165,6 +188,7 @@ def _qsli(
         candidate_block_size,
         **common,
     )
+    plog("QSLI_OUT", indices)
     selected = prepare_indexer_indices(
         indices.squeeze(1),
         positions,
@@ -172,6 +196,7 @@ def _qsli(
         lengths_output=topk_lengths,
         indices_output=indices_output,
     )
+    plog("IDX_SELECT_POST", selected, topk_lengths)
     return selected, candidates
 
 
@@ -234,7 +259,8 @@ def run_a5_indexer(
 
 def build_smla_metadata(length_rows: torch.Tensor, cu_seqlens_q: torch.Tensor) -> torch.Tensor:
     """Build the fixed A5 mixed-quant SMLA launch metadata."""
-    return ops.mixed_quant_sparse_flash_mla_metadata(
+    plog("SMLA_META_IN", length_rows, cu_seqlens_q)
+    metadata = ops.mixed_quant_sparse_flash_mla_metadata(
         length_rows,
         length_rows,
         cu_seqlens_q=cu_seqlens_q,
@@ -247,6 +273,8 @@ def build_smla_metadata(length_rows: torch.Tensor, cu_seqlens_q: torch.Tensor) -
         has_ori_kv=True,
         has_cmp_kv=True,
     )
+    plog("SMLA_META_OUT", metadata)
+    return metadata
 
 
 def _resolve_window_indices(q, metadata, window_size):
@@ -282,6 +310,20 @@ def qsmla(
         cmp_lengths = None
     task_metadata = metadata.swa.smla_metadata
     wait_for_device_metadata(DeviceMetadataStage.ATTENTION, id(task_metadata))
+    plog("SMLA_META_CONSUME", task_metadata)
+    plog(
+        "SMLA_IN",
+        q,
+        ori_kv,
+        cmp_kv,
+        ori_indices,
+        ori_lengths,
+        cmp_indices,
+        cmp_lengths,
+        sinks,
+        softmax_scale,
+        window_size,
+    )
     output, _ = ops.mixed_quant_sparse_flash_mla(
         q,
         ori_kv=ori_kv,
@@ -303,6 +345,7 @@ def qsmla(
         layout_kv="PA_BBND",
         return_softmax_lse=False,
     )
+    plog("SMLA_OUT", output)
     return output
 
 
@@ -323,6 +366,7 @@ def write_attention_cache(
         quant_mode = "mxfp8_bf16"
     else:
         raise ValueError(f"unsupported A5 cache kind: {kind}")
+    plog("KV_WRITE_IN", kind, group_size, quant_mode, values, flat_slots)
     torch.ops._C_ascend.kv_compress_epilog_v2(
         cache_arg,
         values.contiguous(),
@@ -332,6 +376,7 @@ def write_attention_cache(
         round_scale=True,
         x_scale=1.0,
     )
+    plog("KV_WRITE_OUT", kind, cache)
 
 
 def write_index_cache(

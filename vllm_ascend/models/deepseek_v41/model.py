@@ -68,6 +68,7 @@ from vllm_ascend.models.common.ops.sequence_parallel import (
 from vllm_ascend.ops.dsa import AscendDeepseekSparseAttention, DSAModules
 from vllm_ascend.ops.rope_dsv4 import ComplexExpRotaryEmbedding
 from vllm_ascend.ops.triton.mul_add import muls_add_triton
+from vllm_ascend.precision_probe import plog
 from vllm_ascend.utils import (
     enable_dsa_cp,
     get_rotation_path,
@@ -843,20 +844,27 @@ class DeepseekV41DecoderLayer(nn.Module):
 
     def rms_norm_cast(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Normalize once and provide the exact FP32 routing input."""
+        plog("RMS_NORM_IN", hidden_states, self.post_attention_layernorm.weight)
         outputs = DeviceOperator.rms_norm_cast(
             hidden_states, self.post_attention_layernorm.weight, self.post_attention_layernorm.variance_epsilon
         )
         if outputs is not None:
+            plog("RMS_NORM_OUT", outputs[0], outputs[1])
             return outputs
         normalized = self.post_attention_layernorm(hidden_states)
+        plog("RMS_NORM_OUT", normalized, normalized.float())
         return normalized, normalized.float()
 
     @staticmethod
     def hc_collapse(x, pre_mix):
-        return (pre_mix.unsqueeze(-1) * x.float()).sum(-2).to(x.dtype)
+        plog("HC_COLLAPSE_IN", x, pre_mix)
+        out = (pre_mix.unsqueeze(-1) * x.float()).sum(-2).to(x.dtype)
+        plog("HC_COLLAPSE_OUT", out)
+        return out
 
     def hc_pre(self, x, hc_fn, hc_scale, hc_base, pre_mix=None):
-        return torch.ops._C_ascend.npu_hc_pre_v3(
+        plog("HC_PRE_IN", self.layer_idx, x, hc_fn, hc_scale, hc_base, pre_mix)
+        out = torch.ops._C_ascend.npu_hc_pre_v3(
             x,
             hc_fn,
             hc_scale,
@@ -867,14 +875,19 @@ class DeepseekV41DecoderLayer(nn.Module):
             norm_eps=self.norm_eps,
             hc_eps=self.hc_eps,
         )
+        plog("HC_PRE_OUT", self.layer_idx, *out)
+        return out
 
     def hc_post(self, x, residual, post, comb):
-        return torch.ops._C_ascend.npu_hc_post(
+        plog("HC_POST_IN", self.layer_idx, x, residual, post, comb)
+        out = torch.ops._C_ascend.npu_hc_post(
             x.unsqueeze(0),
             residual.unsqueeze(0),
             post.unsqueeze(0),
             comb.unsqueeze(0),
         ).squeeze(0)
+        plog("HC_POST_OUT", self.layer_idx, out)
+        return out
 
     def forward(
         self,
