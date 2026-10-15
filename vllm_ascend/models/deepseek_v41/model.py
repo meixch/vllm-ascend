@@ -11,6 +11,8 @@ from dataclasses import dataclass
 from functools import partial
 from typing import Any
 
+import cann_ops_transformer  # noqa: F401  # Registers torch.ops.cann_ops_transformer.* from the wheel.
+import custom_ops  # noqa: F401  # Registers torch.ops.custom.* from the wheel.
 import torch
 import torch.nn.functional as F
 import torch_npu
@@ -74,7 +76,6 @@ from vllm_ascend.utils import (
     enable_dsa_cp,
     get_rotation_path,
     normalize_deepseek_v41_config,
-    resolve_wheel_op,
 )
 
 from .cache_config import (
@@ -865,7 +866,7 @@ class DeepseekV41DecoderLayer(nn.Module):
 
     def hc_pre(self, x, hc_fn, hc_scale, hc_base, pre_mix=None):
         plog("HC_PRE_IN", self.layer_idx, x, hc_fn, hc_scale, hc_base, pre_mix)
-        out = resolve_wheel_op("npu_hc_pre_v2")(
+        out = torch.ops.custom.npu_hc_pre_v2(
             x=x,
             hc_fn=hc_fn,
             hc_scale=hc_scale,
@@ -881,7 +882,7 @@ class DeepseekV41DecoderLayer(nn.Module):
 
     def hc_post(self, x, residual, post, comb):
         plog("HC_POST_IN", self.layer_idx, x, residual, post, comb)
-        out = resolve_wheel_op("mhc_post")(residual, comb, x, post)
+        out = torch.ops.cann_ops_transformer.mhc_post(residual, comb, x, post)
         plog("HC_POST_OUT", self.layer_idx, out)
         return out
 
