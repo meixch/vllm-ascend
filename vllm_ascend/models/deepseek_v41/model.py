@@ -11,13 +11,21 @@ from dataclasses import dataclass
 from functools import partial
 from typing import Any
 
-import cann_ops_transformer  # noqa: F401  # Registers torch.ops.cann_ops_transformer.* from the wheel.
-import custom_ops  # noqa: F401  # Registers torch.ops.custom.* from the wheel.
 import torch
 import torch.nn.functional as F
 import torch_npu
 import vllm.envs as envs
 from torch import nn
+
+try:
+    import cann_ops_transformer  # noqa: F401  # Registers torch.ops.cann_ops_transformer.* from the wheel.
+    import custom_ops  # noqa: F401  # Registers torch.ops.custom.* from the wheel.
+
+    _DS41_WHEEL_OPS = True
+except ImportError:
+    # A3 environments do not ship the ds41 operator wheels; the decoder layer
+    # falls back to the in-tree mHC operators there.
+    _DS41_WHEEL_OPS = False
 from transformers import PretrainedConfig
 from vllm.config import CUDAGraphMode, ParallelConfig, VllmConfig, get_current_vllm_config
 from vllm.distributed import (
@@ -81,6 +89,7 @@ from vllm_ascend.utils import (
 from .cache_config import (
     make_mla_cache_spec,
     make_swa_cache_spec,
+    uses_a5_packed_cache,
 )
 from .compressor import DeepseekV41Compressor
 from .engram import (
@@ -833,6 +842,10 @@ class DeepseekV41DecoderLayer(nn.Module):
         self.hc_ffn_base = nn.Parameter(torch.empty(mix_hc, dtype=torch.float32))
         self.hc_attn_scale = nn.Parameter(torch.empty(3, dtype=torch.float32))
         self.hc_ffn_scale = nn.Parameter(torch.empty(3, dtype=torch.float32))
+        # The ds41 wheel operators (mHC v2, fused compressor, indexer prologue)
+        # exist only in the A5 operator-package environment; every other
+        # device keeps this repository's in-tree operators.
+        self._ds41_wheel_ops = _DS41_WHEEL_OPS and uses_a5_packed_cache()
         self.use_sequence_parallel = vllm_config.parallel_config.use_sequence_parallel_moe
         # Leave the TP partial sums for the reduce-scatter below. The mHC
         # and MoE paths then stay sharded between attention calls.
@@ -846,16 +859,26 @@ class DeepseekV41DecoderLayer(nn.Module):
             self.engram = None
 
     def rms_norm_cast(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Normalize with the native NPU RMSNorm and provide the FP32 routing input."""
+        """Normalize once and provide the exact FP32 routing input."""
         plog("RMS_NORM_IN", hidden_states, self.post_attention_layernorm.weight)
-        x, _ = torch_npu.npu_rms_norm(
-            hidden_states,
-            self.post_attention_layernorm.weight,
-            epsilon=self.post_attention_layernorm.variance_epsilon,
+        if self._ds41_wheel_ops:
+            x, _ = torch_npu.npu_rms_norm(
+                hidden_states,
+                self.post_attention_layernorm.weight,
+                epsilon=self.post_attention_layernorm.variance_epsilon,
+            )
+            x_fp32 = x.float()
+            plog("RMS_NORM_OUT", x, x_fp32)
+            return x, x_fp32
+        outputs = DeviceOperator.rms_norm_cast(
+            hidden_states, self.post_attention_layernorm.weight, self.post_attention_layernorm.variance_epsilon
         )
-        x_fp32 = x.float()
-        plog("RMS_NORM_OUT", x, x_fp32)
-        return x, x_fp32
+        if outputs is not None:
+            plog("RMS_NORM_OUT", outputs[0], outputs[1])
+            return outputs
+        normalized = self.post_attention_layernorm(hidden_states)
+        plog("RMS_NORM_OUT", normalized, normalized.float())
+        return normalized, normalized.float()
 
     @staticmethod
     def hc_collapse(x, pre_mix):
@@ -866,23 +889,44 @@ class DeepseekV41DecoderLayer(nn.Module):
 
     def hc_pre(self, x, hc_fn, hc_scale, hc_base, pre_mix=None):
         plog("HC_PRE_IN", self.layer_idx, x, hc_fn, hc_scale, hc_base, pre_mix)
-        out = torch.ops.custom.npu_hc_pre_v2(
-            x=x,
-            hc_fn=hc_fn,
-            hc_scale=hc_scale,
-            hc_base=hc_base,
-            pre_mix=pre_mix,
-            hc_mult=self.hc_mult,
-            hc_sinkhorn_iters=self.hc_sinkhorn_iters,
-            norm_eps=self.norm_eps,
-            hc_eps=self.hc_eps,
-        )
+        if self._ds41_wheel_ops:
+            out = torch.ops.custom.npu_hc_pre_v2(
+                x=x,
+                hc_fn=hc_fn,
+                hc_scale=hc_scale,
+                hc_base=hc_base,
+                pre_mix=pre_mix,
+                hc_mult=self.hc_mult,
+                hc_sinkhorn_iters=self.hc_sinkhorn_iters,
+                norm_eps=self.norm_eps,
+                hc_eps=self.hc_eps,
+            )
+        else:
+            out = torch.ops._C_ascend.npu_hc_pre_v3(
+                x,
+                hc_fn,
+                hc_scale,
+                hc_base,
+                pre_mix,
+                hc_mult=self.hc_mult,
+                hc_sinkhorn_iters=self.hc_sinkhorn_iters,
+                norm_eps=self.norm_eps,
+                hc_eps=self.hc_eps,
+            )
         plog("HC_PRE_OUT", self.layer_idx, *out)
         return out
 
     def hc_post(self, x, residual, post, comb):
         plog("HC_POST_IN", self.layer_idx, x, residual, post, comb)
-        out = torch.ops.cann_ops_transformer.mhc_post(residual, comb, x, post)
+        if self._ds41_wheel_ops:
+            out = torch.ops.cann_ops_transformer.mhc_post(residual, comb, x, post)
+        else:
+            out = torch.ops._C_ascend.npu_hc_post(
+                x.unsqueeze(0),
+                residual.unsqueeze(0),
+                post.unsqueeze(0),
+                comb.unsqueeze(0),
+            ).squeeze(0)
         plog("HC_POST_OUT", self.layer_idx, out)
         return out
 

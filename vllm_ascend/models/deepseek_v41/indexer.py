@@ -4,9 +4,15 @@
 
 import torch
 import torch_npu
-from cann_ops_transformer.ops.ds41 import indexer_prologue_k
 from torch import nn
 from vllm.model_executor.layers.linear import ReplicatedLinear
+
+try:
+    from cann_ops_transformer.ops.ds41 import indexer_prologue_k
+except ImportError:
+    # A3 environments may not ship the ds41 operator package; the packed
+    # cache path below requires it and raises a clear error when missing.
+    indexer_prologue_k = None
 
 from vllm_ascend.attention.dsa_v41 import (
     DeepseekV41CacheLayer,
@@ -157,6 +163,11 @@ class DeepseekV41Indexer(nn.Module):
                 norm_eps=self.k_norm.eps,
             )
             plog("IDX_K_CACHE_IN", k_cache, scale_cache, slots)
+            if indexer_prologue_k is None:
+                raise RuntimeError(
+                    "cann_ops_transformer.ops.ds41.indexer_prologue_k is required "
+                    "on the A5 packed-cache path; install the ds41 operator wheels"
+                )
             # storage_mode=0 writes the separated K/scale planes (QLI view);
             # the operator folds rows internally for storage_mode=1.
             indexer_prologue_k(

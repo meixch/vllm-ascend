@@ -59,6 +59,10 @@ class DeepseekV41Compressor(nn.Module):
     def __init__(self, config, ratio, vllm_config=None, prefix="compressor"):
         super().__init__()
         self.ratio = ratio
+        # The fused ds41 compressor op exists only in the A5 wheel
+        # environment; other devices keep the eager Triton pooling path.
+        self._fused = uses_a5_packed_cache()
+        self._ring_num_cores = None
         self.width = config.head_dim
         dim = config.hidden_size
         self.wkv = nn.Linear(dim, self.width, bias=False, dtype=torch.float32 if ratio == 2 else torch.bfloat16)
@@ -90,7 +94,10 @@ class DeepseekV41Compressor(nn.Module):
                 )
 
     def process_weights_after_loading(self):
-        """Adapt the fused compressor operands after weight loading."""
+        """Adapt the fused compressor operands after weight loading (A5 only)."""
+        if not self._fused:
+            # The eager Triton path keeps the checkpoint dtypes.
+            return
         if self.ratio == 1:
             self.wkv.weight.data = maybe_trans_nz(self.wkv.weight.data)
         elif self.ratio == 2:
@@ -99,13 +106,18 @@ class DeepseekV41Compressor(nn.Module):
             self.wgate.weight.data = self.wgate.weight.data.to(torch.bfloat16)
 
     def prepare_ring_compressor(self, max_tokens, device):
-        """Check the profiled per-source output buffer before capture."""
-        actual_device = self._ring_pooled.device
-        compatible_device = actual_device.type == device.type and (
-            device.index is None or actual_device.index == device.index
-        )
-        if self._ring_pooled.shape[0] < max_tokens or not compatible_device:
-            raise ValueError("Ring output capacity/device must be established before memory profiling")
+        """Resolve ring-compressor hardware before capture."""
+        if self._fused:
+            actual_device = self._ring_pooled.device
+            compatible_device = actual_device.type == device.type and (
+                device.index is None or actual_device.index == device.index
+            )
+            if self._ring_pooled.shape[0] < max_tokens or not compatible_device:
+                raise ValueError("Ring output capacity/device must be established before memory profiling")
+        else:
+            from vllm_ascend.ops.triton.compressor.compressor_triton import _cube_core_num
+
+            self._ring_num_cores = _cube_core_num()
 
     def pool_projected(self, hidden_states, metadata):
         """Fused ds41 compressor path: project + gated-pool inside the op.
@@ -118,6 +130,8 @@ class DeepseekV41Compressor(nn.Module):
         """
         from cann_ops_transformer.ops.ds41 import compressor as compressor_v2
 
+        if not self._fused:
+            raise RuntimeError("The fused ds41 compressor path requires the A5 wheel environment")
         if not hasattr(self, "_ring_pooled"):
             raise RuntimeError("Ring compressor must be initialized before graph capture")
         if hidden_states.shape[0] > self._ring_pooled.shape[0]:
@@ -140,6 +154,25 @@ class DeepseekV41Compressor(nn.Module):
             compact,
             metadata.c2_complete_mask[:num_tokens],
             self._ring_pooled[:num_tokens],
+        )
+        plog("CMP_R2_POOLED", pooled)
+        out = self.norm(pooled)
+        plog("CMP_R2_OUT", out)
+        return out
+
+    def pool_projected_eager(self, kv, scores, metadata):
+        """Eager Triton path (non-A5): pool pre-projected KV/scores over the ring state."""
+        from vllm_ascend.ops.triton.compressor.compressor_triton import compressor_from_projected
+
+        plog("CMP_R2_IN", kv, scores, metadata.c2_ring_metadata)
+        pooled = compressor_from_projected(
+            kv,
+            scores,
+            self.state_cache.kv_cache[0].squeeze(-2),
+            metadata.c2_ring_metadata,
+            self._ring_pooled[: kv.shape[0]],
+            max_query_len=metadata.max_query_len,
+            num_cores=self._ring_num_cores,
         )
         plog("CMP_R2_POOLED", pooled)
         out = self.norm(pooled)
