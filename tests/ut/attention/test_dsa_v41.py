@@ -191,7 +191,7 @@ def test_a5_indexer_uses_prequantized_query(monkeypatch):
     monkeypatch.setattr(a5_indexer, "wait_for_device_metadata", lambda *args: None)
     monkeypatch.setattr(
         a5_indexer,
-        "quantize_mxfp4_indexer",
+        "quantize_query_mxfp4",
         lambda query: pytest.fail("query must not be quantized twice"),
     )
     query = torch.zeros(2, 1, 128)

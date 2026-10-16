@@ -28,7 +28,6 @@ from vllm_ascend.models.deepseek_v41.cache_config import (
 from vllm_ascend.models.deepseek_v41.mixed_quant_attention import quantize_query_mxfp4
 from vllm_ascend.ops.triton.prepare_indexer_indices import prepare_indexer_indices
 from vllm_ascend.ops.triton.quantize_indexer_query import quantize_indexer_query
-from vllm_ascend.precision_probe import plog
 from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ, maybe_trans_nz
 from vllm_ascend.worker.device_metadata import (
     DeviceMetadataStage,
@@ -138,7 +137,6 @@ class DeepseekV41Indexer(nn.Module):
         """Publish source-owned index K before latent is RoPE'd as long KV."""
         if not self.owns_k or latent.shape[0] == 0:
             return
-        plog("IDX_K_LATENT", latent, slots, cos, sin)
         k_cache, scale_cache = self.k_cache.kv_cache[0]
         if self.packed_cache_ops is not None:
             if slots.ndim == 1:
@@ -162,7 +160,6 @@ class DeepseekV41Indexer(nn.Module):
                 rope_cos=cos.reshape(-1, self.rope_width),
                 norm_eps=self.k_norm.eps,
             )
-            plog("IDX_K_CACHE_IN", k_cache, scale_cache, slots)
             if indexer_prologue_k is None:
                 raise RuntimeError(
                     "cann_ops_transformer.ops.ds41.indexer_prologue_k is required "
@@ -193,14 +190,10 @@ class DeepseekV41Indexer(nn.Module):
                     combined_block_size=self.candidate_block_size,
                     **prologue_common,
                 )
-                plog("IDX_K_FOLD_OUT", self.k_cache_folded.kv_cache[0])
-            plog("IDX_K_CACHE_OUT", k_cache, scale_cache)
             return
         key = self.k_norm(self.wk(latent)).view(-1, 1, self.width)
-        plog("IDX_K_PROJ", key)
         DeviceOperator.apply_partial_rotary_inplace(key, cos, sin, start=self.width - self.rope_width, end=self.width)
         key = key.squeeze(1)
-        plog("IDX_K_ROPE", key)
         quantized, scale = torch_npu.npu_dynamic_quant(key, dst_type=torch.int8)
         scatter_cache_sk(k_cache, slots, quantized)
         scatter_cache_sk(
@@ -230,11 +223,8 @@ class DeepseekV41Indexer(nn.Module):
     ):
         """Score index K, optionally filter blocks, then return position TopK."""
         query = self.project_query(qr)
-        plog("IDX_Q_PROJ", query)
         self.apply_query_rope(query, cos, sin)
-        plog("IDX_Q_ROPE", query)
         weights = self.project_weights(hidden_states)
-        plog("IDX_Q_WEIGHTS", weights)
 
         return self.select_projected(
             query,

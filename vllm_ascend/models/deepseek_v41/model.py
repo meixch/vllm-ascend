@@ -79,7 +79,6 @@ from vllm_ascend.models.common.ops.sequence_parallel import (
 from vllm_ascend.ops.dsa import AscendDeepseekSparseAttention, DSAModules
 from vllm_ascend.ops.rope_dsv4 import ComplexExpRotaryEmbedding
 from vllm_ascend.ops.triton.mul_add import muls_add_triton
-from vllm_ascend.precision_probe import plog
 from vllm_ascend.utils import (
     enable_dsa_cp,
     get_rotation_path,
@@ -860,7 +859,6 @@ class DeepseekV41DecoderLayer(nn.Module):
 
     def rms_norm_cast(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Normalize once and provide the exact FP32 routing input."""
-        plog("RMS_NORM_IN", hidden_states, self.post_attention_layernorm.weight)
         if self._ds41_wheel_ops:
             x, _ = torch_npu.npu_rms_norm(
                 hidden_states,
@@ -868,27 +866,21 @@ class DeepseekV41DecoderLayer(nn.Module):
                 epsilon=self.post_attention_layernorm.variance_epsilon,
             )
             x_fp32 = x.float()
-            plog("RMS_NORM_OUT", x, x_fp32)
             return x, x_fp32
         outputs = DeviceOperator.rms_norm_cast(
             hidden_states, self.post_attention_layernorm.weight, self.post_attention_layernorm.variance_epsilon
         )
         if outputs is not None:
-            plog("RMS_NORM_OUT", outputs[0], outputs[1])
             return outputs
         normalized = self.post_attention_layernorm(hidden_states)
-        plog("RMS_NORM_OUT", normalized, normalized.float())
         return normalized, normalized.float()
 
     @staticmethod
     def hc_collapse(x, pre_mix):
-        plog("HC_COLLAPSE_IN", x, pre_mix)
         out = (pre_mix.unsqueeze(-1) * x.float()).sum(-2).to(x.dtype)
-        plog("HC_COLLAPSE_OUT", out)
         return out
 
     def hc_pre(self, x, hc_fn, hc_scale, hc_base, pre_mix=None):
-        plog("HC_PRE_IN", self.layer_idx, x, hc_fn, hc_scale, hc_base, pre_mix)
         if self._ds41_wheel_ops:
             out = torch.ops.custom.npu_hc_pre_v2(
                 x=x,
@@ -913,11 +905,9 @@ class DeepseekV41DecoderLayer(nn.Module):
                 norm_eps=self.norm_eps,
                 hc_eps=self.hc_eps,
             )
-        plog("HC_PRE_OUT", self.layer_idx, *out)
         return out
 
     def hc_post(self, x, residual, post, comb):
-        plog("HC_POST_IN", self.layer_idx, x, residual, post, comb)
         if self._ds41_wheel_ops:
             out = torch.ops.cann_ops_transformer.mhc_post(residual, comb, x, post)
         else:
@@ -927,7 +917,6 @@ class DeepseekV41DecoderLayer(nn.Module):
                 post.unsqueeze(0),
                 comb.unsqueeze(0),
             ).squeeze(0)
-        plog("HC_POST_OUT", self.layer_idx, out)
         return out
 
     def forward(

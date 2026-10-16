@@ -10,7 +10,6 @@ from vllm.v1.kv_cache_interface import CircularBufferSpec
 from vllm_ascend.attention.dsa_v41 import DeepseekV41CacheLayer
 from vllm_ascend.core.kv_cache_interface import AscendCircularBufferSpec
 from vllm_ascend.models.deepseek_v41.cache_config import STATE_RING_ROWS, uses_a5_packed_cache
-from vllm_ascend.precision_probe import plog
 from vllm_ascend.utils import maybe_trans_nz
 
 
@@ -136,7 +135,6 @@ class DeepseekV41Compressor(nn.Module):
             raise RuntimeError("Ring compressor must be initialized before graph capture")
         if hidden_states.shape[0] > self._ring_pooled.shape[0]:
             raise ValueError("Compressor batch exceeds its prepared output capacity")
-        plog("CMP_R2_IN", hidden_states, metadata.c2_ring_metadata)
         ring_meta = metadata.c2_ring_metadata
         compact = compressor_v2(
             hidden_states,
@@ -155,16 +153,13 @@ class DeepseekV41Compressor(nn.Module):
             metadata.c2_complete_mask[:num_tokens],
             self._ring_pooled[:num_tokens],
         )
-        plog("CMP_R2_POOLED", pooled)
         out = self.norm(pooled)
-        plog("CMP_R2_OUT", out)
         return out
 
     def pool_projected_eager(self, kv, scores, metadata):
         """Eager Triton path (non-A5): pool pre-projected KV/scores over the ring state."""
         from vllm_ascend.ops.triton.compressor.compressor_triton import compressor_from_projected
 
-        plog("CMP_R2_IN", kv, scores, metadata.c2_ring_metadata)
         pooled = compressor_from_projected(
             kv,
             scores,
@@ -174,14 +169,10 @@ class DeepseekV41Compressor(nn.Module):
             max_query_len=metadata.max_query_len,
             num_cores=self._ring_num_cores,
         )
-        plog("CMP_R2_POOLED", pooled)
         out = self.norm(pooled)
-        plog("CMP_R2_OUT", out)
         return out
 
     def forward(self, x):
         """Project an uncompressed source; ratio-2 uses ``pool_projected``."""
-        plog("CMP_R1_IN", x)
         out = self.norm(self.wkv(x))
-        plog("CMP_R1_OUT", out)
         return out
