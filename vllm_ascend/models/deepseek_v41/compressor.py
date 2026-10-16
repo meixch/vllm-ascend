@@ -45,7 +45,7 @@ def _compact_to_token_aligned(
     return out
 
 
-class NpuRMSNorm(nn.Module):
+class DeepseekV41RMSNorm(nn.Module):
     def __init__(self, width, eps):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(width, dtype=torch.bfloat16))
@@ -62,7 +62,7 @@ class DeepseekV41Compressor(nn.Module):
         self.width = config.head_dim
         dim = config.hidden_size
         self.wkv = nn.Linear(dim, self.width, bias=False, dtype=torch.float32 if ratio == 2 else torch.bfloat16)
-        self.norm = NpuRMSNorm(self.width, config.rms_norm_eps)
+        self.norm = DeepseekV41RMSNorm(self.width, config.rms_norm_eps)
         if ratio == 2:
             self.wgate = nn.Linear(dim, self.width, bias=False, dtype=torch.float32)
             # Allocate persistent output before memory profiling, so its footprint

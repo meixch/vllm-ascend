@@ -6,7 +6,6 @@ import torch
 import torch_npu
 from cann_ops_transformer.ops.ds41 import indexer_prologue_k
 from torch import nn
-from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import ReplicatedLinear
 
 from vllm_ascend.attention.dsa_v41 import (
@@ -29,6 +28,8 @@ from vllm_ascend.worker.device_metadata import (
     DeviceMetadataStage,
     wait_for_device_metadata,
 )
+
+from .compressor import DeepseekV41RMSNorm
 
 
 class DeepseekV41Indexer(nn.Module):
@@ -85,7 +86,7 @@ class DeepseekV41Indexer(nn.Module):
                 bias=False,
                 dtype=torch.bfloat16,
             )
-            self.k_norm = RMSNorm(self.width, eps=config.rms_norm_eps, dtype=torch.bfloat16)
+            self.k_norm = DeepseekV41RMSNorm(self.width, config.rms_norm_eps)
             self.k_cache = DeepseekV41CacheLayer(
                 vllm_config,
                 f"{prefix}.k_cache",
@@ -153,7 +154,7 @@ class DeepseekV41Indexer(nn.Module):
                 norm_weight=norm_weight,
                 rope_sin=sin.reshape(-1, self.rope_width),
                 rope_cos=cos.reshape(-1, self.rope_width),
-                norm_eps=self.k_norm.variance_epsilon,
+                norm_eps=self.k_norm.eps,
             )
             plog("IDX_K_CACHE_IN", k_cache, scale_cache, slots)
             # storage_mode=0 writes the separated K/scale planes (QLI view);
