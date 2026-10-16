@@ -153,7 +153,7 @@ class DeepseekV41Indexer(nn.Module):
                 norm_weight=norm_weight,
                 rope_sin=sin.reshape(-1, self.rope_width),
                 rope_cos=cos.reshape(-1, self.rope_width),
-                norm_eps=self.k_norm.eps,
+                norm_eps=self.k_norm.variance_epsilon,
             )
             plog("IDX_K_CACHE_IN", k_cache, scale_cache, slots)
             # storage_mode=0 writes the separated K/scale planes (QLI view);
