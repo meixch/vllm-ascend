@@ -1762,6 +1762,16 @@ class AscendDeepseekV41LLMForCausalLM(nn.Module, DeepseekV41MixtureOfExperts, Su
         loaded = self._load_model_weights((name, tensor) for name, tensor in weights if self._is_milestone_weight(name))
         return loaded
 
+    def process_weights_after_loading(self) -> None:
+        # The operator-wheel operands (Nz wk for indexer_prologue_k, BF16
+        # wkv/wgate for the fused ds41 compressor) are adapted per module
+        # after checkpoint loading. The vLLM loader only invokes quant-method
+        # hooks, so walk the explicit module types here; the VL wrapper
+        # delegates its own hook to this method.
+        for _, module in self.named_modules():
+            if isinstance(module, (DeepseekV41Compressor, DeepseekV41Indexer)):
+                module.process_weights_after_loading()
+
     def set_moe_parameters(self):
         self.expert_weights = []
 

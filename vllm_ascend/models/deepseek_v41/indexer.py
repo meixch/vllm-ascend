@@ -114,14 +114,17 @@ class DeepseekV41Indexer(nn.Module):
         """Prepare the fused indexer_prologue_k operands after weight loading."""
         if not self.owns_k:
             return
-        weight = maybe_trans_nz(self.wk.weight.data)
-        if self.packed_cache_ops is not None and torch_npu.get_npu_format(weight) != ACL_FORMAT_FRACTAL_NZ:
-            raise RuntimeError(
-                "V4.1 indexer_prologue_k requires an Nz wk weight; start "
-                "with --additional-config '{\"weight_nz_mode\": 2}' (A5 "
-                "defaults to mode 1, which leaves BF16 weights in ND)"
-            )
-        self.wk.weight.data = weight
+        if self.packed_cache_ops is not None:
+            # The fused indexer_prologue_k requires its wk operand in Nz
+            # format. This is a local requirement of the prologue op, so the
+            # conversion is forced here instead of relying on the global
+            # weight_nz_mode=2, which would also convert the MoE gate weight
+            # that the A5 npu_fused_matmul gate path requires in ND format.
+            if torch_npu.get_npu_format(self.wk.weight.data) != ACL_FORMAT_FRACTAL_NZ:
+                self.wk.weight.data = torch_npu.npu_format_cast(self.wk.weight.data, ACL_FORMAT_FRACTAL_NZ)
+        else:
+            # Non-quantized caches keep the eager chain: follow the global policy.
+            self.wk.weight.data = maybe_trans_nz(self.wk.weight.data)
         self._prologue_norm_weight = self.k_norm.weight.detach().to(torch.float32)
 
     def update_keys(self, latent, slots, cos, sin):
