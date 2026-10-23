@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import inspect
 from collections.abc import Hashable
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -30,6 +31,13 @@ from vllm.v1.worker.encoder_cudagraph import BudgetGraphMetadata, EncoderCudaGra
 
 from vllm_ascend.utils import weak_ref_tensors
 
+_ENCODER_SUPPORTS_CAPTURE_AXES = (
+    "axis_keys" in inspect.signature(EncoderCudaGraphManager._capture_budget_graph).parameters
+)
+
+CaptureAxisKeys = tuple[Hashable, ...]
+EncoderGraphKey = tuple[str, int] | tuple[str, int, CaptureAxisKeys]
+
 # ---------------------------------------------------------------------------
 # Per–encoder-budget ACL graph bookkeeping (ViT FIA tasks)
 # ---------------------------------------------------------------------------
@@ -37,29 +45,55 @@ from vllm_ascend.utils import weak_ref_tensors
 
 @dataclass
 class EncoderGraphParams:
-    """Mirrors :class:`vllm_ascend.compilation.acl_graph.GraphParams` but keyed by encoder token budget."""
+    """FIA graph-task state keyed by encoder path, budget, and optional capture axes."""
 
-    # TODO: Fully support upstream dual-path encoder graph on Ascend. The
-    # current FIA bookkeeping is keyed only by token_budget; dual-path models
-    # need graph params separated by (path, token_budget).
-    events: dict[int, list[torch.npu.ExternalEvent]] = field(default_factory=dict)
-    workspaces: dict[int, torch.Tensor | None] = field(default_factory=dict)
-    handles: dict[int, list[Any]] = field(default_factory=dict)
+    events: dict[EncoderGraphKey, list[torch.npu.ExternalEvent]] = field(default_factory=dict)
+    workspaces: dict[EncoderGraphKey, torch.Tensor | None] = field(default_factory=dict)
+    handles: dict[EncoderGraphKey, list[Any]] = field(default_factory=dict)
     # Flattened per-forward insertion order (one entry per ViT block invocation).
-    attn_params: dict[int, list[tuple]] = field(default_factory=dict)
+    attn_params: dict[EncoderGraphKey, list[tuple]] = field(default_factory=dict)
 
 
 _encoder_graph_params: EncoderGraphParams | None = None
 
 
-def set_encoder_graph_params(token_budgets: list[int]) -> None:
+def _graph_key(
+    token_budget: int,
+    path: str = "default",
+    axis_keys: CaptureAxisKeys = (),
+) -> EncoderGraphKey:
+    return (path, token_budget, axis_keys) if axis_keys else (path, token_budget)
+
+
+def _ensure_graph_params(key: EncoderGraphKey) -> None:
+    params = get_encoder_graph_params()
+    if params is None:
+        raise RuntimeError("Encoder graph parameters must be initialized before capture.")
+    params.events.setdefault(key, [])
+    params.workspaces.setdefault(key, None)
+    params.handles.setdefault(key, [])
+    params.attn_params.setdefault(key, [])
+
+
+def set_encoder_graph_params(
+    path_token_budgets: dict[str, list[int]] | list[int],
+) -> None:
     global _encoder_graph_params
-    budgets_sorted_unique = sorted(token_budgets)
+    # Accept the old list form for callers outside this module while keeping
+    # independent FIA state for every upstream encoder graph path.
+    if isinstance(path_token_budgets, list):
+        path_token_budgets = {"default": path_token_budgets}
+    keys = {
+        _graph_key(token_budget, path)
+        for path, budgets in path_token_budgets.items()
+        for token_budget in budgets
+        if token_budget > 0
+    }
     _encoder_graph_params = EncoderGraphParams(
-        events={b: [] for b in budgets_sorted_unique},
-        workspaces={b: None for b in budgets_sorted_unique},
-        handles={b: [] for b in budgets_sorted_unique},
-        attn_params={b: [] for b in budgets_sorted_unique},
+        events={key: [] for key in sorted(keys)},
+        workspaces={key: None for key in sorted(keys)},
+        handles={key: [] for key in sorted(keys)},
+        attn_params={key: [] for key in sorted(keys)},
     )
 
 
@@ -67,10 +101,15 @@ def get_encoder_graph_params() -> EncoderGraphParams | None:
     return _encoder_graph_params
 
 
-def update_encoder_graph_workspace(token_budget: int, workspace: torch.Tensor) -> None:
+def update_encoder_graph_workspace(
+    token_budget: int,
+    workspace: torch.Tensor,
+    path: str = "default",
+    axis_keys: CaptureAxisKeys = (),
+) -> None:
     if _encoder_graph_params is None:
         return
-    _encoder_graph_params.workspaces[token_budget] = workspace
+    _encoder_graph_params.workspaces[_graph_key(token_budget, path, axis_keys)] = workspace
 
 
 # ---------------------------------------------------------------------------
@@ -87,6 +126,8 @@ class EncoderForwardContext:
     """
 
     token_budget: int | None = None
+    path: str = "default"
+    axis_keys: CaptureAxisKeys = ()
     capturing: bool = False
     capture_layer_cursor: int = 0
     cu_seqlens_cpu: torch.Tensor | None = None
@@ -105,6 +146,8 @@ def _reset_encoder_forward_context() -> None:
     """Clear replay-time host length fields."""
 
     _context.token_budget = None
+    _context.path = "default"
+    _context.axis_keys = ()
     _context.capturing = False
     _context.cu_seqlens_cpu = None
     _context.cu_window_seqlens_cpu = None
@@ -116,6 +159,8 @@ def set_encoder_forward_context(
     token_budget: int,
     capturing: bool,
     *,
+    path: str = "default",
+    axis_keys: CaptureAxisKeys = (),
     cu_seqlens_cpu: torch.Tensor | None = None,
     cu_window_seqlens_cpu: torch.Tensor | None = None,
     sequence_lengths_cpu: torch.Tensor | None = None,
@@ -127,6 +172,8 @@ def set_encoder_forward_context(
     """
 
     _context.token_budget = token_budget
+    _context.path = path
+    _context.axis_keys = axis_keys
     _context.capturing = capturing
     _context.cu_seqlens_cpu = cu_seqlens_cpu
     _context.cu_window_seqlens_cpu = cu_window_seqlens_cpu
@@ -228,6 +275,8 @@ def _maybe_compute_actual_seq_lengths(
 def update_encoder_graph_params(
     update_stream: torch.npu.Stream,
     token_budget: int,
+    path: str = "default",
+    axis_keys: CaptureAxisKeys = (),
     *,
     fullatt_block_indexes: set[int] | frozenset[int] | None = None,
 ) -> None:
@@ -242,20 +291,27 @@ def update_encoder_graph_params(
     """
 
     params = get_encoder_graph_params()
-    if params is None or token_budget not in params.handles:
+    graph_key = _graph_key(token_budget, path, axis_keys)
+    if params is None or graph_key not in params.handles:
         return
 
-    handles = params.handles[token_budget]
-    events = params.events[token_budget]
-    attn_blocks = params.attn_params[token_budget]
-    workspace = params.workspaces.get(token_budget)
+    handles = params.handles[graph_key]
+    events = params.events[graph_key]
+    attn_blocks = params.attn_params[graph_key]
+    workspace = params.workspaces.get(graph_key)
 
     if len(handles) != len(events) or len(handles) != len(attn_blocks):
         raise RuntimeError(
             "Encoder graph bookkeeping is inconsistent: "
-            f"budget={token_budget} handles={len(handles)} "
+            f"path={path!r} budget={token_budget} handles={len(handles)} "
             f"events={len(events)} attn_blocks={len(attn_blocks)}"
         )
+
+    cu_seqlens_cpu = get_encoder_forward_context().cu_seqlens_cpu
+    if cu_seqlens_cpu is None:
+        if handles:
+            raise RuntimeError(f"Missing replay cu_seqlens for encoder graph path={path!r} budget={token_budget}")
+        return
 
     with torch.npu.stream(update_stream):
         for handle, event, packed in zip(handles, events, attn_blocks):
@@ -313,25 +369,28 @@ class EncoderAclGraphManager(EncoderCudaGraphManager):
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
-        self.graph_pool = current_platform.get_global_graph_pool()
+        # Keep the upstream lifecycle invariant used by EncoderRunner:
+        # graph_pool is None until capture has completed/started.
+        self.graph_pool = None
         self.update_stream: torch.npu.Stream | None = None
         visual = getattr(self.model, "visual", None)
         fa_raw = getattr(visual, "fullatt_block_indexes", None) if visual is not None else None
         self.fullatt = frozenset(fa_raw) if fa_raw is not None else None
 
     def capture(self, graph_pool: Any | None = None):
-        encoder_graph_pool = graph_pool if graph_pool is not None else self.graph_pool
+        encoder_graph_pool = graph_pool if graph_pool is not None else current_platform.get_global_graph_pool()
         self.graph_pool = encoder_graph_pool
 
-        set_encoder_graph_params(self.token_budgets)
+        set_encoder_graph_params(self.path_token_budgets)
+        try:
+            super().capture(graph_pool=encoder_graph_pool)
+            weak_ref_workspaces()
+        except Exception:
+            self.clear()
+            raise
 
-        super().capture(graph_pool=encoder_graph_pool)
-
-        weak_ref_workspaces()
-
-    def _capture_budget_graph(self, token_budget: int, path: str = "default", axis_keys: tuple[Hashable, ...] = ()):
-        if axis_keys:
-            raise NotImplementedError("Encoder ACL graphs with capture axes are not supported.")
+    def _capture_budget_graph(self, token_budget: int, path: str = "default", axis_keys: CaptureAxisKeys = ()):
+        _ensure_graph_params(_graph_key(token_budget, path, axis_keys))
 
         logger.debug(
             "Capturing encoder aclgraph for budget=%d, max_batch_size=%d, max_frames_per_batch=%d",
@@ -340,7 +399,7 @@ class EncoderAclGraphManager(EncoderCudaGraphManager):
             self.max_frames_per_batch,
         )
 
-        capture_inputs = self.model.prepare_encoder_cudagraph_capture_inputs(
+        capture_args = (
             token_budget,
             self.max_batch_size,
             self.max_frames_per_batch,
@@ -348,12 +407,16 @@ class EncoderAclGraphManager(EncoderCudaGraphManager):
             self.dtype,
             path,
         )
+        capture_inputs = self.model.prepare_encoder_cudagraph_capture_inputs(
+            *capture_args,
+            *((axis_keys,) if _ENCODER_SUPPORTS_CAPTURE_AXES else ()),
+        )
 
         values = capture_inputs.values
 
         graph = torch.npu.NPUGraph()
         with (
-            set_encoder_forward_context(token_budget, True),
+            set_encoder_forward_context(token_budget, True, path=path, axis_keys=axis_keys),
             torch.inference_mode(),
             torch.npu.graph(graph, self.graph_pool),
         ):
@@ -365,27 +428,27 @@ class EncoderAclGraphManager(EncoderCudaGraphManager):
             max_frames_per_batch=self.max_frames_per_batch,
             graph=graph,
             input_buffers=values,
-            output_buffer=weak_ref_tensors(output),
+            output_buffer=output,
+            **({"axis_keys": axis_keys} if _ENCODER_SUPPORTS_CAPTURE_AXES else {}),
         )
         graph_set = self._get_graph_set(path)
-        graph_set[token_budget] = graph_meta
+        graph_map_key = token_budget if not axis_keys else (token_budget, axis_keys)
+        graph_set[graph_map_key] = graph_meta
 
     def _run_budget_graph(
         self,
         mm_kwargs: dict[str, Any],
         token_budget: int,
         path: str = "default",
-        axis_keys: tuple[Hashable, ...] = (),
+        axis_keys: CaptureAxisKeys = (),
     ) -> torch.Tensor | None:
-        if axis_keys:
-            raise NotImplementedError("Encoder ACL graphs with capture axes are not supported.")
-
         num_items = len(self._get_item_specs(mm_kwargs))
         graph_set = self._get_graph_set(path)
-        if token_budget not in graph_set:
+        graph_map_key = token_budget if not axis_keys else (token_budget, axis_keys)
+        if graph_map_key not in graph_set:
             self.graph_misses += num_items
             return None
-        graph_meta = graph_set[token_budget]
+        graph_meta = graph_set[graph_map_key]
 
         replay = self.model.prepare_encoder_cudagraph_replay_buffers(
             mm_kwargs,
@@ -416,20 +479,41 @@ class EncoderAclGraphManager(EncoderCudaGraphManager):
         update_stream = self.update_stream
         if update_stream is None:
             update_stream = torch.npu.Stream()
+            self.update_stream = update_stream
 
+        # Input buffers are populated on the current stream. The side stream
+        # that updates FIA graph tasks must not race those copies (or an earlier
+        # replay) before the graph is launched.
+        update_stream.wait_stream(torch.npu.current_stream())
         graph_meta.graph.replay()
 
         with set_encoder_forward_context(
             token_budget,
             False,
+            path=path,
+            axis_keys=axis_keys,
             cu_seqlens_cpu=cu_seqlens_cpu,
             cu_window_seqlens_cpu=cu_window_seqlens_cpu,
             sequence_lengths_cpu=seq_lens_cpu,
         ):
-            update_encoder_graph_params(update_stream, token_budget, fullatt_block_indexes=self.fullatt)
+            update_encoder_graph_params(
+                update_stream,
+                token_budget,
+                path=path,
+                axis_keys=axis_keys,
+                fullatt_block_indexes=self.fullatt,
+            )
 
         self.graph_hits += num_items
         return graph_meta.output_buffer
+
+    def clear(self) -> None:
+        """Release graph-owned tensors and reset the FIA replay state."""
+        global _encoder_graph_params
+        super().clear()
+        _encoder_graph_params = None
+        _reset_encoder_forward_context()
+        self.update_stream = None
 
 
 def weak_ref_workspaces() -> None:

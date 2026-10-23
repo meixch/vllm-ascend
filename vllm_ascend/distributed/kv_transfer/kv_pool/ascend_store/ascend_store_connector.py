@@ -14,6 +14,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
     KVConnectorMetadata,
     KVConnectorRole,
+    KVConnectorTransferResults,
     SupportsHMA,
 )
 from vllm.forward_context import ForwardContext
@@ -89,6 +90,11 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
         self.consumer_is_to_put = vllm_config.kv_transfer_config.kv_connector_extra_config.get(
             "consumer_is_to_put", False
         )
+        # Mamba hybrid state must be copied after a synchronous layerwise/bulk KV
+        # load so the SSM state matches the KV cache. Preserve the v0.30.0+
+        # connector contract consumed by the V2 model runner / mamba hybrid states.
+        self.requires_mamba_state_copy_after_layer_load = self.use_layerwise
+        self.requires_mamba_state_copy_after_load = not self.use_layerwise and not extra_config.get("load_async", False)
 
         connector_name = vllm_config.kv_transfer_config.kv_connector
         if connector_name == "MooncakeConnectorStoreV1":
@@ -119,6 +125,23 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
                     self.use_layerwise,
                     self.use_layerwise_range,
                 )
+
+    def shutdown(self):
+        """Stop store users before closing the backend's native resources."""
+        try:
+            if self.connector_scheduler is not None:
+                client = self.connector_scheduler.client
+                try:
+                    if client is not None:
+                        client.close()
+                finally:
+                    self.connector_scheduler.store_scheduler.close()
+        finally:
+            if hasattr(self, "lookup_server"):
+                self.lookup_server.close()
+            if self.connector_worker is not None:
+                self.connector_worker.shutdown()
+            super().shutdown()
 
     ############################################################
     # Scheduler Side Methods
@@ -271,6 +294,16 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
         )
         return done_sending, done_recving
 
+    def get_transfer_results(self, finished_req_ids: set[str]) -> KVConnectorTransferResults:
+        done_sending, done_recving = self.get_finished(finished_req_ids)
+        assert self.connector_worker is not None
+        failed = self.connector_worker.get_failed_requests()
+        if self.connector_worker.load_async and not self.use_layerwise:
+            done_recving |= failed
+        return KVConnectorTransferResults(
+            finished_sending=done_sending, finished_recving=done_recving, failed_recving=failed
+        )
+
     def get_block_ids_with_load_errors(self) -> set[int]:
         """Return KV block IDs that failed to load on the worker."""
         assert self.connector_worker is not None
@@ -295,6 +328,35 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
     def build_connector_worker_meta(self) -> AscendStoreKVConnectorWorkerMetadata | None:
         assert self.connector_worker is not None
         return self.connector_worker.build_connector_worker_meta()
+
+    def get_kv_connector_stats(self) -> KVConnectorStats | None:
+        if self.connector_scheduler is not None:
+            return self.connector_scheduler.get_stats()
+        if self.connector_worker is not None:
+            return self.connector_worker.get_stats()
+        return None
+
+    @classmethod
+    def build_kv_connector_stats(cls, data: dict[str, Any] | None = None) -> KVConnectorStats:
+        return AscendStoreKVConnectorStats(data=data or {})
+
+    @classmethod
+    def build_prom_metrics(
+        cls,
+        vllm_config: VllmConfig,
+        metric_types: dict[type[PromMetric], type[PromMetricT]],
+        labelnames: list[str],
+        per_engine_labelvalues: dict[int, list[object]],
+    ) -> KVConnectorPromMetrics:
+        return AscendStorePromMetrics(
+            vllm_config,
+            metric_types,
+            labelnames,
+            per_engine_labelvalues,
+        )
+
+    def has_pending_push_work(self) -> bool:
+        return bool(self.connector_scheduler and self.connector_scheduler.has_pending_push_work())
 
 
 class LookupKeyServer:

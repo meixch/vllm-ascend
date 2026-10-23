@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from functools import lru_cache, partial
 from importlib import import_module
 from typing import Any, cast
+from weakref import proxy
 
 from vllm.logger import logger
 from vllm.v1.core.block_pool import BlockPool
@@ -22,6 +24,39 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import
 
 _CACHE_MISSING = object()
 _MANAGER_CLASS_CACHE_ATTR = "_manager_class_cache"
+_REACHABLE_MASK_CACHE_SIZE = 32
+
+
+class _HBMBlockHash(bytes):
+    """A hash whose complete hash block is already computed locally."""
+
+
+class _HBMPrefixBlockHashes(Sequence[BlockHash]):
+    """Mark local hashes on access, without expanding per-group hit sets.
+
+    Managers select each group's terminal hash without copying it. That hash
+    is local exactly when the complete group block ends within the HBM prefix;
+    an interior hash cannot make a larger, partially local block hit.
+    """
+
+    def __init__(self, block_hashes: Sequence[BlockHash], num_hbm_hashes: int) -> None:
+        self._block_hashes = block_hashes
+        self._num_hbm_hashes = num_hbm_hashes
+
+    def __len__(self) -> int:
+        return len(self._block_hashes)
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            return [self[i] for i in range(*index.indices(len(self)))]
+        if index < 0:
+            index += len(self)
+        if not 0 <= index < len(self):
+            raise IndexError(index)
+        block_hash = self._block_hashes[index]
+        if index < self._num_hbm_hashes:
+            return cast(BlockHash, _HBMBlockHash(block_hash_to_bytes(block_hash)))
+        return block_hash
 
 
 class ExternalCachedBlockPool:
@@ -39,7 +74,7 @@ class ExternalCachedBlockPool:
         block_hash: BlockHash,
         group_ids: list[int],
     ) -> list[KVCacheBlock] | None:
-        if self._exists is None:
+        if self._exists is None or isinstance(block_hash, _HBMBlockHash):
             return [self._present_block] * len(group_ids)
         h = _block_hash_to_bytes(block_hash)
         if all((group_id, h) in self._exists for group_id in group_ids):
@@ -110,6 +145,10 @@ class AscendStoreCoordinator:
             self.eagle_group_ids = set(range(len(kv_cache_groups)))
 
         self._verify_and_split_kv_cache_groups()
+        # Do not keep the coordinator alive through its cache while GC is frozen.
+        self._cached_reachable_masks = lru_cache(maxsize=_REACHABLE_MASK_CACHE_SIZE)(
+            partial(type(self)._reachable_masks, proxy(self))
+        )
 
     def _verify_and_split_kv_cache_groups(self) -> None:
         attention_groups: list[tuple[KVCacheSpec, list[int], type[SingleTypeKVCacheManager]]] = []
@@ -155,7 +194,7 @@ class AscendStoreCoordinator:
 
     def find_longest_cache_hit(
         self,
-        block_hashes: list[BlockHash],
+        block_hashes: Sequence[BlockHash],
         max_length: int,
         cached_block_pool: ExternalCachedBlockPool,
         *,
@@ -253,7 +292,7 @@ class AscendStoreCoordinator:
 
     def _find_hit_blocks(
         self,
-        block_hashes: list[BlockHash],
+        block_hashes: Sequence[BlockHash],
         max_length: int,
         cached_block_pool: ExternalCachedBlockPool,
         *,

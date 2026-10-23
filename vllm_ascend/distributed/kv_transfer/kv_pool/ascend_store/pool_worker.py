@@ -14,6 +14,7 @@ from vllm.distributed import (
     get_pcp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    get_tp_group,
 )
 from vllm.distributed.kv_events import BlockStored
 from vllm.logger import logger
@@ -62,10 +63,47 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.coordinator import
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer import (
     KVCacheStoreLayerRecvingThread,
     KVCacheStoreLayerSendingThread,
+    KVCacheStoreLayerSendingThreadBase,
     KVCacheStoreRecvingThread,
     KVCacheStoreSendingThread,
     KVTransferThread,
     record_failed_blocks,
+)
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_cache_layout import (
+    LayerwiseReuseLayout,
+    build_layerwise_cache_layout,
+    build_layerwise_reuse_layout,
+    get_layerwise_kv_cache_specs,
+    get_layerwise_physical_layer_index,
+)
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
+    AscendConnectorMetadata,
+    AscendStoreKVConnectorWorkerMetadata,
+    ChunkedTokenDatabase,
+    KeyMetadata,
+    LayerBlockRange,
+    LayerLoadTask,
+    LayerMultiBlockReqMeta,
+    LayerTransferTask,
+    ReqMeta,
+    SharedBlockData,
+    block_hash_to_str,
+    get_block_hashes,
+    get_group_block_size,
+    get_group_cache_family,
+    get_partial_block_index,
+    infer_cache_transfer_granularity,
+    infer_cacheable_group_ids,
+    infer_dcp_mismatch_info,
+    infer_group_block_sizes,
+    infer_group_cache_families,
+    infer_tp_mismatch_info,
+    is_kv_save_role,
+    masked_block_runs,
+    uses_hybrid_kv_cache,
+)
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metrics import (
+    AscendStoreKVConnectorStats,
 )
 from vllm_ascend.distributed.utils import (
     get_decode_context_model_parallel_rank,
@@ -87,6 +125,11 @@ backend_map = {
     },
 }
 
+# Read lease TTL (ms) for the layerwise load path. batch_add_lease acquires a
+# read lease before batch_copy(G2L); the lease must cover the asynchronous
+# multi-layer load time.
+LAYERWISE_READ_LEASE_TTL_MS = 5 * 60 * 1000
+MEMCACHE_SSD_HIT_GVA = (1 << 64) - 1
 
 @dataclass(frozen=True)
 class _LayerwiseRangeBlock:
@@ -153,6 +196,7 @@ class KVPoolWorker:
         self.kv_role = vllm_config.kv_transfer_config.kv_role
         self.load_async = vllm_config.kv_transfer_config.kv_connector_extra_config.get("load_async", False)
         self._invalid_block_ids: set[int] = set()
+        self._failed_requests: set[str] = set()
         self._invalid_block_ids_lock = threading.Lock()
         self.consumer_is_to_put = vllm_config.kv_transfer_config.kv_connector_extra_config.get(
             "consumer_is_to_put", False
@@ -224,7 +268,7 @@ class KVPoolWorker:
             self.put_step = 1
 
         partitions = None
-        if self.kv_role == "kv_consumer" and self.consumer_is_to_put:
+        if self.kv_role == "kv_consumer" and self.can_put:
             num_hidden_layers = model_config.hf_text_config.num_hidden_layers
             partition_list_str = vllm_config.kv_transfer_config.kv_connector_extra_config.get(
                 "prefill_pp_layer_partition", None
@@ -434,8 +478,79 @@ class KVPoolWorker:
         block_size_scale = tensor_num_blocks // self.num_blocks
         block_len = cache[0].numel() * cache.element_size() * block_size_scale
         block_stride = cache.stride(0) * cache.element_size() * block_size_scale
-        region_len = (self.num_blocks - 1) * block_stride + block_len if self.num_blocks else 0
+        # Registration covers the physical span, including gaps between kernel
+        # blocks inside one scheduler block and non-contiguous inner views.
+        region_len = (
+            (1 + sum((size - 1) * stride for size, stride in zip(cache.shape, cache.stride()))) * cache.element_size()
+            if cache.numel()
+            else 0
+        )
         return block_len, block_stride, region_len, block_size_scale
+
+    def _get_cache_transfer_segments(self, cache: torch.Tensor) -> list[tuple[int, int, int]]:
+        """Describe full-block pool transfers without crossing kernel-page gaps.
+
+        Both bulk and layerwise transfers must preserve physical-block gaps.
+        Partial layerwise transfers also retain each segment's token interval.
+        """
+        block_len, block_stride, _, scale = self._get_cache_block_metadata(cache)
+        physical_bytes = block_len // scale
+        physical_stride = block_stride // scale
+        if scale == 1 or physical_stride == physical_bytes:
+            return [(cache.data_ptr(), block_len, block_stride)]
+        if not cache[0].is_contiguous():
+            raise ValueError("Segmented KV pool transfer requires contiguous data inside each physical block.")
+        return [(cache.data_ptr() + index * physical_stride, physical_bytes, block_stride) for index in range(scale)]
+
+    def _get_combined_cache_transfer_segments(
+        self, caches: tuple[torch.Tensor, ...], group_id: int
+    ) -> list[tuple[int, int, int]] | None:
+        """Coalesce adjacent MLA components for complete bulk pages only.
+
+        The packed object becomes physical-page major. All readers and writers
+        must use this layout and a fresh namespace when upgrading an old pool.
+        Layerwise/partial transfers retain component-major segment metadata.
+        """
+        if self.use_layerwise or len(caches) != 2:
+            return None
+        extra_config = getattr(self, "_extra_config", None)
+        if not isinstance(extra_config, dict) or extra_config.get("discard_partial_chunks", True) is not True:
+            return None
+        if extra_config.get("save_decode_cache", False) or getattr(self, "tp_mismatch", False):
+            return None
+        if getattr(self, "dcp_size", 1) != 1 or getattr(self, "use_kvpp", False):
+            return None
+        block_sizes = getattr(self, "grouped_block_size", ())
+        granularity = getattr(self, "cache_transfer_granularity", 0)
+        if group_id >= len(block_sizes) or not granularity or granularity % block_sizes[group_id]:
+            return None
+        align_state = getattr(self, "group_uses_align_state", ())
+        if group_id < len(align_state) and align_state[group_id]:
+            return None
+        first, second = caches
+        if (
+            first.ndim != 4
+            or second.ndim != 4
+            or first.shape[:-1] != second.shape[:-1]
+            or first.dtype != second.dtype
+            or first.device != second.device
+            or self._get_storage_key(first) != self._get_storage_key(second)
+            or not first[0].is_contiguous()
+            or not second[0].is_contiguous()
+        ):
+            return None
+        first_len, block_stride, _, scale = self._get_cache_block_metadata(first)
+        second_len, second_stride, _, second_scale = self._get_cache_block_metadata(second)
+        if scale <= 1 or scale != second_scale or block_stride != second_stride:
+            return None
+        first_bytes = first_len // scale
+        page_bytes = (first_len + second_len) // scale
+        page_stride = block_stride // scale
+        if second.data_ptr() != first.data_ptr() + first_bytes or page_stride < page_bytes:
+            return None
+        if page_stride == page_bytes:
+            return [(first.data_ptr(), first_len + second_len, block_stride)]
+        return [(first.data_ptr() + index * page_stride, page_bytes, block_stride) for index in range(scale)]
 
     @staticmethod
     def _get_storage_key(cache: torch.Tensor) -> int:
@@ -1037,6 +1152,8 @@ class KVPoolWorker:
             cache_role="kv",
             group_cache_families=self.group_kv_cache_families,
             group_num_layers=self.group_num_layers,
+            group_layer_cache_entry_offsets=self.group_layer_cache_entry_offsets,
+            group_cache_entry_segments=self.group_cache_entry_segments,
         )
 
         if self.use_layerwise and not self.use_layerwise_range:
@@ -2012,6 +2129,7 @@ class KVPoolWorker:
                 token_len,
                 block_hashes,
                 kv_cache_group_id=group_id,
+                chunk_mask=lookup_mask,
             ):
                 key = chunk.key
                 variants = self._expand_lookup_key_variants(key.to_string(), group_id, include_all_ranks)
@@ -2249,7 +2367,7 @@ class KVPoolWorker:
         return []
 
     def build_connector_worker_meta(self) -> AscendStoreKVConnectorWorkerMetadata | None:
-        if self.use_mamba and isinstance(self.kv_send_thread, KVCacheStoreSendingThread):
+        if isinstance(self.kv_send_thread, KVCacheStoreSendingThread):
             if ce := self.kv_send_thread.get_completed_events():
                 return AscendStoreKVConnectorWorkerMetadata(ce)
         return None

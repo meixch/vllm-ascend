@@ -75,6 +75,11 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
             )
             for connector in self._connectors
         )
+        # Consumed by the V2 model runner / mamba hybrid states to decide whether
+        # the SSM state must be re-copied after a synchronous KV load.
+        self.requires_mamba_state_copy_after_load = any(
+            getattr(connector, "requires_mamba_state_copy_after_load", False) for connector in self._connectors
+        )
 
         # Phase 2: only then may sibling hooks publish reuse-enabling work.
         for connector in self._non_slot_release_connectors:
